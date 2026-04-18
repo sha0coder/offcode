@@ -1,12 +1,5 @@
 # offcode
 
-```
-
-      ╭──────────╮
-      │  ◉    ◉  │   offcode
-      │   ╰──╯   │   offline coding assistant
-      ╰──────────╯   powered by ollama · type a prompt to begin
-```
 
 ![Offcode ASCII art](pics/pic1.png)
 
