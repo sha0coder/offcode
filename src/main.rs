@@ -60,11 +60,15 @@ fn main() {
     if !client.is_healthy() {
         eprintln!(
             "{}{}Error:{} Cannot connect to Ollama at {}",
-            ui::BOLD, ui::RED, ui::RESET, cfg.ollama_url
+            ui::BOLD,
+            ui::RED,
+            ui::RESET,
+            cfg.ollama_url
         );
         eprintln!(
             "{}Tip:{}   Run `ollama serve` or install Ollama.",
-            ui::YELLOW, ui::RESET
+            ui::YELLOW,
+            ui::RESET
         );
         std::process::exit(1);
     }
@@ -103,7 +107,11 @@ fn run_repl(cfg: Config, client: Client) {
     ui::print_mascot(&cfg.model);
     println!(
         "{}Connected {} model: {}{}{}",
-        ui::DIM, ui::RESET, ui::CYAN, cfg.model, ui::RESET
+        ui::DIM,
+        ui::RESET,
+        ui::CYAN,
+        cfg.model,
+        ui::RESET
     );
     println!("{}Type /help, /exit to quit.{}\n", ui::DIM, ui::RESET);
 
@@ -176,10 +184,7 @@ fn run_turn(cfg: &Config, client: &Client, messages: &mut Vec<Message>, input: &
 
     loop {
         if iters >= cfg.max_tool_iters {
-            println!(
-                "\n{}Max tool iterations reached.{}",
-                ui::YELLOW, ui::RESET
-            );
+            println!("\n{}Max tool iterations reached.{}", ui::YELLOW, ui::RESET);
             break;
         }
         iters += 1;
@@ -198,18 +203,23 @@ fn run_turn(cfg: &Config, client: &Client, messages: &mut Vec<Message>, input: &
         let mut first_token = true;
 
         let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let result = client.chat_stream(&request, cfg.show_thinking, no_cancel, |token: &str, is_thinking: bool| {
-            if first_token && !is_thinking {
-                print!("{}", ui::WHITE);
-                first_token = false;
-            }
-            if is_thinking {
-                print!("{}{}{}", ui::DIM, token, ui::RESET);
-            } else {
-                print!("{token}");
-            }
-            io::stdout().flush().ok();
-        });
+        let result = client.chat_stream(
+            &request,
+            cfg.show_thinking,
+            no_cancel,
+            |token: &str, is_thinking: bool| {
+                if first_token && !is_thinking {
+                    print!("{}", ui::WHITE);
+                    first_token = false;
+                }
+                if is_thinking {
+                    print!("{}{}{}", ui::DIM, token, ui::RESET);
+                } else {
+                    print!("{token}");
+                }
+                io::stdout().flush().ok();
+            },
+        );
 
         match result {
             Ok((content, Some(calls))) => {
@@ -225,19 +235,19 @@ fn run_turn(cfg: &Config, client: &Client, messages: &mut Vec<Message>, input: &
                     let args = &call.function.arguments;
                     println!(
                         "\n{}{}⚙ {}{}{}{}",
-                        ui::BOLD, ui::BRIGHT_YELLOW, ui::RESET, ui::CYAN, name, ui::RESET
+                        ui::BOLD,
+                        ui::BRIGHT_YELLOW,
+                        ui::RESET,
+                        ui::CYAN,
+                        name,
+                        ui::RESET
                     );
                     if let Some(obj) = args.as_object() {
                         for (k, v) in obj {
                             let val = match v {
                                 serde_json::Value::String(s) => {
-                                    let first: String = s
-                                        .lines()
-                                        .next()
-                                        .unwrap_or("")
-                                        .chars()
-                                        .take(80)
-                                        .collect();
+                                    let first: String =
+                                        s.lines().next().unwrap_or("").chars().take(80).collect();
                                     if s.lines().count() > 1 {
                                         format!("{first}…")
                                     } else {
@@ -315,7 +325,7 @@ fn print_help() {
     println!("  offcode [OPTIONS] [PROMPT]");
     println!();
     println!("{b}OPTIONS{r}");
-    println!("  {c}-m, --model <MODEL>{r}   {d}Model to use (default: qwen3:14b-16k){r}");
+    println!("  {c}-m, --model <MODEL>{r}   {d}Model to use (default: gemma4:e4b){r}");
     println!("  {c}    --url <URL>{r}       {d}Ollama base URL{r}");
     println!("  {c}    --think{r}           {d}Show thinking tokens{r}");
     println!("  {c}    --no-tui{r}          {d}Plain terminal mode (no TUI){r}");

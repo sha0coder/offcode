@@ -25,6 +25,9 @@ Works like Claude Code or OpenCode but talks only to a local Ollama instance but
 
 - [Ollama](https://ollama.com) running locally (`ollama serve`)
 
+- download a good model:
+ollama pull gemma4:e4b
+
 ## Install
 
 ### From source
@@ -38,20 +41,13 @@ make install          # → /usr/local/bin/offcode
 make install-user     # → ~/.local/bin/offcode
 ```
 
-### Pre-built binaries
-
-Download from the releases page, make executable and move to your PATH:
-
-```bash
-chmod +x offcode-*-macos-arm64
-mv offcode-*-macos-arm64 /usr/local/bin/offcode
-```
 
 ## Usage
 
 ```bash
-# Interactive TUI
+# recommended way: Interactive TUI
 offcode
+/model gemma4:e4b
 
 # Single prompt (non-interactive, pipe-friendly)
 offcode 'explain src/main.rs'
@@ -112,7 +108,7 @@ Config file is created automatically at first run:
 **Linux:** `~/.config/offcode/config.toml`
 
 ```toml
-model = "qwen3:14b-16k"
+model = "gemma4:e4b"
 ollama_url = "http://localhost:11434"
 temperature = 0.6
 num_ctx = 16384
@@ -154,17 +150,6 @@ make dist
 | `ratatui` | Terminal UI |
 
 No async runtime. No OpenSSL. Fully offline after model is pulled.
-
-## Supported models (tested)
-
-Any Ollama model with tool/function calling support:
-
-- `qwen3:14b-16k` ⭐ (recommended, best tool use)
-- `qwen3:8b`, `qwen3:14b`
-- `qwen2.5-coder:7b`, `qwen2.5-coder:14b`
-- `llama3.2`, `llama3.1`
-- `deepseek-r1:14b` (has thinking, use `--think`)
-- `mistral-nemo`
 
 ## License
 

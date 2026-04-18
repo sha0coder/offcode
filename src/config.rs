@@ -15,7 +15,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model: "qwen3:14b-16k".to_string(),
+            model: "gemma4:e4b".to_string(),
             ollama_url: "http://localhost:11434".to_string(),
             system_prompt: concat!(
                 "You are offcode, an offline AI coding assistant running locally via Ollama. ",
