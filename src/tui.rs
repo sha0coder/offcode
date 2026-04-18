@@ -575,31 +575,45 @@ fn entry_to_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
 // ── mascot ────────────────────────────────────────────────────────────────────
 
 fn mascot_lines() -> Vec<Line<'static>> {
-    let s = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let d = Style::default().fg(Color::DarkGray);
+    // ╭──────────╮ = 12 chars (10 inside)
+    // eyes:   ◉    ◉   = 2+1+4+1+2 = 10 ✓
+    // smile:   ╰──╯    = 3+4+3     = 10 ✓
+    let fr = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let ey = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let sm = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let d  = Style::default().fg(Color::DarkGray);
+    let br = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let ac = Style::default().fg(Color::Cyan);
+
     vec![
         Line::raw(""),
-        Line::from(vec![Span::styled("        ╔═══╗ ╔═══╗", s)]),
+        //      ╭──────────╮
+        Line::from(vec![Span::styled("      ╭──────────╮", fr)]),
+        //      │  ◉    ◉  │   offcode
         Line::from(vec![
-            Span::styled("        ║ ◉ ║ ║ ◉ ║", s),
-            Span::styled("   offcode — offline coding assistant", d),
+            Span::styled("      │  ", fr),
+            Span::styled("◉", ey),
+            Span::raw("    "),
+            Span::styled("◉", ey),
+            Span::styled("  │   ", fr),
+            Span::styled("offcode", br),
         ]),
+        //      │   ╰──╯   │   offline coding assistant
         Line::from(vec![
-            Span::styled("        ╚═══╝ ╚═══╝", s),
-            Span::styled("   powered by ollama", d),
+            Span::styled("      │   ", fr),
+            Span::styled("╰──╯", sm),
+            Span::styled("   │   ", fr),
+            Span::styled("offline coding assistant", d),
         ]),
-        Line::from(vec![Span::styled("          ╔═════╗", s)]),
+        //      ╰──────────╯   powered by ollama · type a prompt
         Line::from(vec![
-            Span::styled("          ║ ~~~ ║", s),
-            Span::styled("   type a prompt to start", d),
+            Span::styled("      ╰──────────╯   ", fr),
+            Span::styled("powered by ollama · type a prompt to begin", d),
         ]),
-        Line::from(vec![Span::styled("          ╚══╤══╝", s)]),
-        Line::from(vec![Span::styled("          ╔══╧══╗", s)]),
-        Line::from(vec![Span::styled("          ║     ║", s)]),
-        Line::from(vec![Span::styled("          ╚═════╝", s)]),
         Line::raw(""),
+        Line::from(vec![
+            Span::styled("      ", ac),
+        ]),
     ]
 }
 

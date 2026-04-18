@@ -12,7 +12,8 @@
       "Bash(cargo search *)",
       "Bash(cargo add *)",
       "Bash(cargo tree *)",
-      "Bash(./target/release/offcode *)"
+      "Bash(./target/release/offcode *)",
+      "Bash(cargo run *)"
     ]
   }
 }

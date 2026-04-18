@@ -1,21 +1,22 @@
 # offcode
 
 ```
-    ╔═══╗ ╔═══╗
-    ║ ◉ ║ ║ ◉ ║   offcode — offline coding assistant
-    ╚═══╝ ╚═══╝   powered by ollama
-      ╔═════╗
-      ║ ~~~ ║
-      ╚══╤══╝
-      ╔══╧══╗
-      ║     ║
-      ╚═════╝
+
+      ╭──────────╮
+      │  ◉    ◉  │   offcode
+      │   ╰──╯   │   offline coding assistant
+      ╰──────────╯   powered by ollama · type a prompt to begin
 ```
 
-An offline AI coding assistant that runs entirely on your machine via [Ollama](https://ollama.com).
-No cloud. No API keys. No telemetry. Just you and your model.
+![Offcode ASCII art](pics/pic1.png)
 
-Works like Claude Code or OpenCode but talks only to a local Ollama instance.
+## What is this?
+
+This is a commandline based coding agent that it's really 100% offline, it just connect to ollama locally.
+I this this because projects like opencode makes tcp connections even using offline mode.
+Use your favourite [Ollama](https://ollama.com) model for coding your private projects. No cloud. No API keys. No telemetry. Just you and your model.
+
+Works like Claude Code or OpenCode but talks only to a local Ollama instance but keeping your privacy.
 
 ## Features
 
@@ -30,18 +31,13 @@ Works like Claude Code or OpenCode but talks only to a local Ollama instance.
 ## Requirements
 
 - [Ollama](https://ollama.com) running locally (`ollama serve`)
-- A model with tool-calling support, e.g.:
-
-```bash
-ollama pull qwen3:14b-16k
-```
 
 ## Install
 
 ### From source
 
 ```bash
-git clone <repo>
+git clone git@github.com:sha0coder/offcode.git
 cd offcode
 make build
 make install          # → /usr/local/bin/offcode
