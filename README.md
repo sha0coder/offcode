@@ -13,7 +13,7 @@
 ## What is this?
 
 This is a commandline based coding agent that it's really 100% offline, it just connect to ollama locally.
-I this this because projects like opencode makes tcp connections even using offline mode.
+I created this this because projects like opencode makes tcp connections even using offline mode.
 Use your favourite [Ollama](https://ollama.com) model for coding your private projects. No cloud. No API keys. No telemetry. Just you and your model.
 
 Works like Claude Code or OpenCode but talks only to a local Ollama instance but keeping your privacy.
