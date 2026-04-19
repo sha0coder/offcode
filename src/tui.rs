@@ -1,7 +1,7 @@
 use std::sync::{mpsc, Arc, atomic::{AtomicBool, Ordering}};
 
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -13,6 +13,144 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::ollama::{ChatRequest, Client, Message, Options};
 use crate::tools;
+
+// ── line editor (input, cursor, history, completion) ─────────────────────────
+
+enum KeyOutcome { Submit, Complete, Handled, Unhandled }
+
+enum CompleteOutcome { None, Replaced, Extended, Ambiguous(Vec<String>) }
+
+struct LineEdit {
+    input: String,
+    cursor: usize,
+    history: Vec<String>,
+    history_idx: Option<usize>,
+    draft: String,
+}
+
+impl LineEdit {
+    fn new() -> Self {
+        Self { input: String::new(), cursor: 0, history: Vec::new(), history_idx: None, draft: String::new() }
+    }
+
+    fn set(&mut self, s: String) {
+        self.input = s;
+        self.cursor = self.input.len();
+        self.history_idx = None;
+        self.draft.clear();
+    }
+
+    fn take(&mut self) -> Option<String> {
+        let text = self.input.trim().to_string();
+        if text.is_empty() { return None; }
+        self.input.clear();
+        self.cursor = 0;
+        self.history_idx = None;
+        self.draft.clear();
+        if self.history.last().map(String::as_str) != Some(text.as_str()) {
+            self.history.push(text.clone());
+        }
+        Some(text)
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> KeyOutcome {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('p') => { self.history_prev(); return KeyOutcome::Handled; }
+                KeyCode::Char('n') => { self.history_next(); return KeyOutcome::Handled; }
+                _ => {}
+            }
+        }
+        match key.code {
+            KeyCode::Tab => KeyOutcome::Complete,
+            KeyCode::Enter => KeyOutcome::Submit,
+            KeyCode::Backspace => {
+                if self.cursor > 0 { self.cursor -= 1; self.input.remove(self.cursor); }
+                KeyOutcome::Handled
+            }
+            KeyCode::Delete => {
+                if self.cursor < self.input.len() { self.input.remove(self.cursor); }
+                KeyOutcome::Handled
+            }
+            KeyCode::Left => { if self.cursor > 0 { self.cursor -= 1; } KeyOutcome::Handled }
+            KeyCode::Right => { if self.cursor < self.input.len() { self.cursor += 1; } KeyOutcome::Handled }
+            KeyCode::Home => { self.cursor = 0; KeyOutcome::Handled }
+            KeyCode::End => { self.cursor = self.input.len(); KeyOutcome::Handled }
+            KeyCode::Char(c) => { self.input.insert(self.cursor, c); self.cursor += 1; KeyOutcome::Handled }
+            _ => KeyOutcome::Unhandled,
+        }
+    }
+
+    fn complete(&mut self, start: usize, candidates: &[String]) -> CompleteOutcome {
+        if self.cursor != self.input.len() || start > self.input.len() {
+            return CompleteOutcome::None;
+        }
+        let token = &self.input[start..];
+        match candidates.len() {
+            0 => CompleteOutcome::None,
+            1 => {
+                let head = self.input[..start].to_string();
+                self.input = format!("{}{} ", head, candidates[0]);
+                self.cursor = self.input.len();
+                CompleteOutcome::Replaced
+            }
+            _ => {
+                let lcp = lcp_of(candidates);
+                if lcp.len() > token.len() {
+                    let head = self.input[..start].to_string();
+                    self.input = format!("{head}{lcp}");
+                    self.cursor = self.input.len();
+                    CompleteOutcome::Extended
+                } else {
+                    CompleteOutcome::Ambiguous(candidates.to_vec())
+                }
+            }
+        }
+    }
+
+    fn history_prev(&mut self) {
+        if self.history.is_empty() { return; }
+        let new_idx = match self.history_idx {
+            None => { self.draft = self.input.clone(); self.history.len() - 1 }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_idx = Some(new_idx);
+        self.input = self.history[new_idx].clone();
+        self.cursor = self.input.len();
+    }
+
+    fn history_next(&mut self) {
+        match self.history_idx {
+            None => {}
+            Some(i) if i + 1 >= self.history.len() => {
+                self.history_idx = None;
+                self.input = std::mem::take(&mut self.draft);
+                self.cursor = self.input.len();
+            }
+            Some(i) => {
+                let next = i + 1;
+                self.history_idx = Some(next);
+                self.input = self.history[next].clone();
+                self.cursor = self.input.len();
+            }
+        }
+    }
+}
+
+fn lcp_of(strs: &[String]) -> String {
+    let mut iter = strs.iter();
+    let mut prefix = match iter.next() {
+        Some(s) => s.clone(),
+        None => return String::new(),
+    };
+    for s in iter {
+        let common: String = prefix.chars().zip(s.chars()).take_while(|(a, b)| a == b).map(|(a, _)| a).collect();
+        prefix = common;
+        if prefix.is_empty() { break; }
+    }
+    prefix
+}
 
 // ── worker ↔ app events ───────────────────────────────────────────────────────
 
@@ -67,6 +205,13 @@ impl Entry {
     }
 }
 
+// ── slash commands (used by /help and Tab completion) ────────────────────────
+
+const COMMANDS: &[&str] = &[
+    "/help", "/clear", "/reset", "/tools", "/think",
+    "/model", "/models", "/exit", "/quit",
+];
+
 // ── app ───────────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq)]
@@ -80,8 +225,7 @@ pub struct App {
     client: Client,
     history: Vec<Message>,
     entries: Vec<Entry>,
-    input: String,
-    cursor: usize,
+    editor: LineEdit,
     scroll: u16,
     auto_scroll: bool,
     mode: Mode,
@@ -91,6 +235,7 @@ pub struct App {
     _tx: mpsc::Sender<WorkerMsg>,
     pub should_quit: bool,
     tick: u64,
+    model_names_cache: Option<Vec<String>>,
 }
 
 impl App {
@@ -106,8 +251,7 @@ impl App {
             client,
             history,
             entries: vec![],
-            input: String::new(),
-            cursor: 0,
+            editor: LineEdit::new(),
             scroll: 0,
             auto_scroll: true,
             mode: Mode::Input,
@@ -117,7 +261,49 @@ impl App {
             tick: 0,
             queued: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            model_names_cache: None,
         }
+    }
+
+    fn do_complete(&mut self) {
+        let input = self.editor.input.clone();
+        if !input.starts_with('/') {
+            return;
+        }
+        let (start, candidates): (usize, Vec<String>) = if let Some(sp) = input.find(' ') {
+            let head = &input[..sp];
+            let tail = &input[sp + 1..];
+            if head == "/model" || head == "/models" {
+                let names = self.ensure_model_names();
+                let cands = names.iter().filter(|n| n.starts_with(tail)).cloned().collect();
+                (sp + 1, cands)
+            } else {
+                return;
+            }
+        } else {
+            let cands = COMMANDS
+                .iter()
+                .filter(|c| c.starts_with(input.as_str()))
+                .map(|s| s.to_string())
+                .collect();
+            (0, cands)
+        };
+        if let CompleteOutcome::Ambiguous(cs) = self.editor.complete(start, &candidates) {
+            self.entries.push(Entry::info(cs.join("  ")));
+            self.auto_scroll = true;
+        }
+    }
+
+    fn ensure_model_names(&mut self) -> Vec<String> {
+        if self.model_names_cache.is_none() {
+            let names = self
+                .client
+                .list_models()
+                .map(|ms| ms.into_iter().map(|m| m.name).collect())
+                .unwrap_or_default();
+            self.model_names_cache = Some(names);
+        }
+        self.model_names_cache.clone().unwrap_or_default()
     }
 
     // ── key handling ──────────────────────────────────────────────────────────
@@ -145,65 +331,42 @@ impl App {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) {
+        // Scroll keys belong to the surrounding view, not the line editor.
         match key.code {
-            KeyCode::Enter => {
-                self.submit();
-            }
-            KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.input.remove(self.cursor);
-                }
-            }
-            KeyCode::Delete => {
-                if self.cursor < self.input.len() {
-                    self.input.remove(self.cursor);
-                }
-            }
-            KeyCode::Left => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                }
-            }
-            KeyCode::Right => {
-                if self.cursor < self.input.len() {
-                    self.cursor += 1;
-                }
-            }
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.len(),
             KeyCode::Up => {
                 self.auto_scroll = false;
                 self.scroll = self.scroll.saturating_sub(1);
+                return;
             }
             KeyCode::Down => {
                 self.scroll += 1;
-                // auto_scroll resumes when user scrolls to bottom (handled in render)
+                return;
             }
             KeyCode::PageUp => {
                 self.auto_scroll = false;
                 self.scroll = self.scroll.saturating_sub(10);
+                return;
             }
             KeyCode::PageDown => {
                 self.scroll += 10;
-            }
-            KeyCode::Char(c) => {
-                self.input.insert(self.cursor, c);
-                self.cursor += 1;
+                return;
             }
             _ => {}
+        }
+        match self.editor.handle_key(key) {
+            KeyOutcome::Submit => self.submit(),
+            KeyOutcome::Complete => self.do_complete(),
+            KeyOutcome::Handled | KeyOutcome::Unhandled => {}
         }
     }
 
     // ── submission ────────────────────────────────────────────────────────────
 
     fn submit(&mut self) {
-        let text = self.input.trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-        self.input.clear();
-        self.cursor = 0;
+        let text = match self.editor.take() {
+            Some(t) => t,
+            None => return,
+        };
 
         // Commands run immediately regardless of mode
         if text.starts_with('/') {
@@ -367,8 +530,7 @@ impl App {
             WorkerMsg::Done => {
                 self.mode = Mode::Input;
                 if let Some(queued) = self.queued.take() {
-                    self.input = queued;
-                    self.cursor = self.input.len();
+                    self.editor.set(queued);
                     self.submit();
                 }
             }
@@ -406,7 +568,7 @@ impl App {
         self.render_hints(f, chunks[3]);
 
         // Cursor always visible in input box
-        let cx = chunks[2].x + 1 + 2 + self.cursor as u16;
+        let cx = chunks[2].x + 1 + 2 + self.editor.cursor as u16;
         let cy = chunks[2].y + 1;
         if cx < chunks[2].x + chunks[2].width.saturating_sub(1) {
             f.set_cursor_position((cx, cy));
@@ -487,7 +649,7 @@ impl App {
 
         let content = Line::from(vec![
             Span::styled("> ", Style::default().fg(label_color).add_modifier(Modifier::BOLD)),
-            Span::raw(self.input.clone()),
+            Span::raw(self.editor.input.clone()),
         ]);
 
         f.render_widget(
@@ -503,6 +665,10 @@ impl App {
             Span::styled(" send  ", Style::default().fg(Color::DarkGray)),
             Span::styled("↑↓", Style::default().fg(Color::Cyan)),
             Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("^P/^N", Style::default().fg(Color::Cyan)),
+            Span::styled(" history  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab", Style::default().fg(Color::Cyan)),
+            Span::styled(" complete  ", Style::default().fg(Color::DarkGray)),
             Span::styled("/help", Style::default().fg(Color::Cyan)),
             Span::styled(" commands  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Ctrl+C", Style::default().fg(Color::Cyan)),
@@ -788,7 +954,11 @@ pub fn run(cfg: Config, client: Client) -> std::io::Result<()> {
         // Poll keyboard with 80ms timeout (gives ~12fps animation)
         if event::poll(std::time::Duration::from_millis(80))? {
             if let Event::Key(key) = event::read()? {
-                app.handle_key(key);
+                // crossterm on Windows reports Press, Release, and Repeat —
+                // ignore everything but Press to avoid double-typing.
+                if key.kind == KeyEventKind::Press {
+                    app.handle_key(key);
+                }
             }
         }
 
