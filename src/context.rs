@@ -32,8 +32,13 @@ pub fn save(messages: &[Message]) {
         let _ = std::fs::remove_file(ctx_path());
         return;
     }
-    if let Ok(data) = serde_json::to_string(&messages[1..]) {
-        let _ = std::fs::write(ctx_path(), data);
+    match serde_json::to_string(&messages[1..]) {
+        Ok(data) => {
+            if let Err(e) = std::fs::write(ctx_path(), &data) {
+                eprintln!("offcode: context save error: {e}");
+            }
+        }
+        Err(e) => eprintln!("offcode: context serialize error: {e}"),
     }
 }
 

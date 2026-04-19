@@ -50,6 +50,7 @@ fn main() {
             }
             "--think" => cfg.show_thinking = true,
             "--no-tui" => no_tui = true,
+            "--no-ctx" => cfg.no_ctx = true,
             _ => {
                 prompt_words = raw_args[i..].to_vec();
                 break;
@@ -85,6 +86,7 @@ fn main() {
         }];
         let prompt = prompt_words.join(" ");
         run_turn(&cfg, &client, &mut messages, &prompt);
+        if !cfg.no_ctx { context::save(&messages); }
         return;
     }
 
@@ -168,7 +170,10 @@ fn run_repl(cfg: Config, client: Client) {
             s if s.starts_with('/') => {
                 println!("{}Unknown command. /help{}", ui::DIM, ui::RESET);
             }
-            _ => run_turn(&cfg, &client, &mut messages, &input),
+            _ => {
+                run_turn(&cfg, &client, &mut messages, &input);
+                if !cfg.no_ctx { context::save(&messages); }
+            }
         }
     }
 }

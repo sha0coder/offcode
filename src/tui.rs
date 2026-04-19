@@ -68,18 +68,39 @@ impl LineEdit {
             KeyCode::Tab => KeyOutcome::Complete,
             KeyCode::Enter => KeyOutcome::Submit,
             KeyCode::Backspace => {
-                if self.cursor > 0 { self.cursor -= 1; self.input.remove(self.cursor); }
+                if self.cursor > 0 {
+                    let prev = self.input[..self.cursor]
+                        .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                    self.input.remove(prev);
+                    self.cursor = prev;
+                }
                 KeyOutcome::Handled
             }
             KeyCode::Delete => {
                 if self.cursor < self.input.len() { self.input.remove(self.cursor); }
                 KeyOutcome::Handled
             }
-            KeyCode::Left => { if self.cursor > 0 { self.cursor -= 1; } KeyOutcome::Handled }
-            KeyCode::Right => { if self.cursor < self.input.len() { self.cursor += 1; } KeyOutcome::Handled }
+            KeyCode::Left => {
+                if self.cursor > 0 {
+                    self.cursor = self.input[..self.cursor]
+                        .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                }
+                KeyOutcome::Handled
+            }
+            KeyCode::Right => {
+                if self.cursor < self.input.len() {
+                    let c = self.input[self.cursor..].chars().next().unwrap();
+                    self.cursor += c.len_utf8();
+                }
+                KeyOutcome::Handled
+            }
             KeyCode::Home => { self.cursor = 0; KeyOutcome::Handled }
             KeyCode::End => { self.cursor = self.input.len(); KeyOutcome::Handled }
-            KeyCode::Char(c) => { self.input.insert(self.cursor, c); self.cursor += 1; KeyOutcome::Handled }
+            KeyCode::Char(c) => {
+                self.input.insert(self.cursor, c);
+                self.cursor += c.len_utf8();
+                KeyOutcome::Handled
+            }
             _ => KeyOutcome::Unhandled,
         }
     }
@@ -542,6 +563,7 @@ impl App {
                 self.history.push(msg);
             }
             WorkerMsg::Done => {
+                if !self.cfg.no_ctx { crate::context::save(&self.history); }
                 self.mode = Mode::Input;
                 if let Some(queued) = self.queued.take() {
                     self.editor.set(queued);

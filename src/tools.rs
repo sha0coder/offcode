@@ -132,8 +132,9 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
     match name {
         "read_file" => {
             let path = sarg(&args, "path");
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let content = String::from_utf8_lossy(&bytes).into_owned();
                     if is_code_ext(&path) {
                         content
                             .lines()
@@ -169,6 +170,9 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
 
         "run_command" => {
             let cmd = sarg(&args, "command");
+            if let Err(reason) = check_command_paths(&cmd) {
+                return format!("Blocked: {reason}");
+            }
             match Command::new("sh").arg("-c").arg(&cmd).output() {
                 Ok(out) => {
                     let code = out.status.code().unwrap_or(-1);
@@ -304,7 +308,50 @@ pub fn print_list() {
     }
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── command sandbox ───────────────────────────────────────────────────────────
+
+fn check_command_paths(cmd: &str) -> Result<(), String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let cwd_str = cwd.to_string_lossy();
+
+    // Directories that system binaries may live in — not treated as data paths
+    const SYSTEM_BIN_PREFIXES: &[&str] = &[
+        "/usr/", "/bin/", "/sbin/", "/opt/homebrew/", "/opt/local/",
+        "/nix/", "/snap/", "/proc/", "/dev/null",
+    ];
+
+    // Split on common shell delimiters so we inspect each token
+    for token in cmd.split(|c: char| c.is_whitespace() || matches!(c, '|' | ';' | '&' | '>' | '<' | '(' | ')')) {
+        let token = token.trim_matches(|c| c == '\'' || c == '"');
+        if token.is_empty() || token.starts_with('-') {
+            continue;
+        }
+
+        // Block any directory traversal
+        if token.contains("..") {
+            return Err(format!("'{}' contains '..' (directory traversal)", token));
+        }
+
+        // Check absolute paths
+        if token.starts_with('/') {
+            if SYSTEM_BIN_PREFIXES.iter().any(|p| token.starts_with(p)) {
+                continue;
+            }
+            if !token.starts_with(cwd_str.as_ref()) {
+                return Err(format!("'{}' is outside the current directory", token));
+            }
+        }
+
+        // Block home-dir references
+        if token.starts_with('~') {
+            return Err(format!("'{}' references the home directory", token));
+        }
+    }
+
+    Ok(())
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
 
 fn sarg(args: &Value, key: &str) -> String {
     args.get(key)
@@ -339,6 +386,32 @@ fn is_code_ext(path: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sandbox_blocks_traversal() {
+        assert!(check_command_paths("cat ../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn sandbox_blocks_absolute_outside_cwd() {
+        assert!(check_command_paths("cat /etc/passwd").is_err());
+    }
+
+    #[test]
+    fn sandbox_blocks_home_dir() {
+        assert!(check_command_paths("ls ~/secret").is_err());
+    }
+
+    #[test]
+    fn sandbox_allows_system_binaries() {
+        assert!(check_command_paths("/usr/bin/grep -r pattern .").is_ok());
+    }
+
+    #[test]
+    fn sandbox_allows_relative_paths() {
+        assert!(check_command_paths("ls -la src/").is_ok());
+        assert!(check_command_paths("cargo build").is_ok());
+    }
 
     #[test]
     fn read_file_returns_correct_content() {

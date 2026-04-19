@@ -10,6 +10,8 @@ pub struct Config {
     pub num_ctx: u32,
     pub show_thinking: bool,
     pub max_tool_iters: u32,
+    #[serde(skip)]
+    pub no_ctx: bool,
 }
 
 impl Default for Config {
@@ -21,13 +23,18 @@ impl Default for Config {
                 "You are offcode, an offline AI coding assistant running locally via Ollama. ",
                 "Help the user with software development: reading code, writing files, running commands, ",
                 "debugging, refactoring, and implementing features. ",
+                "You have FULL access to the user's current directory via tools: use read_file to read any file, ",
+                "list_dir to explore the project, search_files to find code, and write_file to make changes. ",
+                "NEVER ask the user to paste code or file contents — always read them yourself with the tools. ",
                 "Use the provided tools whenever you need to interact with the filesystem or shell. ",
-                "Be concise, accurate, and practical."
+                "Be concise, accurate, and practical. ",
+                "At the start of every session, always run list_dir on '.' first to understand the project structure."
             ).to_string(),
             temperature: 0.6,
             num_ctx: 16384,
             show_thinking: false,
             max_tool_iters: 30,
+            no_ctx: false,
         }
     }
 }
