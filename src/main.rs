@@ -1,6 +1,8 @@
 use std::io::{self, BufRead, Write};
 
 mod config;
+mod context;
+mod diff;
 mod ollama;
 mod tools;
 mod tui;
@@ -302,11 +304,21 @@ pub fn build_system_prompt(cfg: &Config) -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
+
+    let ctx_hint = if context::ctx_path().exists() {
+        "\n\nA file named .offcode.ctx exists in the current directory. \
+         It contains the conversation history from previous sessions in JSON format. \
+         Read it with the read_file tool at the start to restore context."
+    } else {
+        ""
+    };
+
     format!(
-        "{}\n\nCurrent directory: {}\nOS: {}",
+        "{}\n\nCurrent directory: {}\nOS: {}{}",
         cfg.system_prompt,
         cwd,
         std::env::consts::OS,
+        ctx_hint,
     )
 }
 

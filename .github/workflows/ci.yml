@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  unit:
+    name: Check + Clippy + Unit tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Unit tests
+        run: cargo test
+
+  integration:
+    name: Integration tests (Ollama + model)
+    runs-on: macos-latest
+    continue-on-error: ${{ github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Ollama
+        run: brew install ollama
+
+      - name: Start Ollama server
+        run: |
+          ollama serve &
+          sleep 5
+
+      - name: Pull model
+        run: ollama pull gemma4:e4b
+
+      - name: Integration tests
+        run: cargo test

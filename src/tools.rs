@@ -152,13 +152,17 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
         "write_file" => {
             let path = sarg(&args, "path");
             let content = sarg(&args, "content");
+            let old_content = std::fs::read_to_string(&path).unwrap_or_default();
             if let Some(parent) = Path::new(&path).parent() {
                 if !parent.as_os_str().is_empty() {
                     let _ = std::fs::create_dir_all(parent);
                 }
             }
             match std::fs::write(&path, &content) {
-                Ok(_) => format!("Wrote {} bytes to '{path}'", content.len()),
+                Ok(_) => {
+                    let diff = crate::diff::generate_diff(&old_content, &content);
+                    format!("Wrote {} bytes to '{path}'\n{diff}", content.len())
+                }
                 Err(e) => format!("Error writing '{path}': {e}"),
             }
         }
@@ -329,6 +333,23 @@ fn is_code_ext(path: &str) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| EXTS.contains(&e))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn read_file_returns_correct_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, "line one\nline two\nline three").unwrap();
+
+        let result = execute("read_file", &json!({ "path": file.to_str().unwrap() }));
+
+        assert_eq!(result.trim(), "line one\nline two\nline three");
+    }
 }
 
 fn search_recursive(

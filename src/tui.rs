@@ -1,7 +1,10 @@
 use std::sync::{mpsc, Arc, atomic::{AtomicBool, Ordering}};
 
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    crossterm::{
+        event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+        execute,
+    },
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -106,6 +109,12 @@ impl LineEdit {
                 }
             }
         }
+    }
+
+    fn insert_str(&mut self, s: &str) {
+        self.input.insert_str(self.cursor, s);
+        self.cursor += s.len();
+        self.history_idx = None;
     }
 
     fn history_prev(&mut self) {
@@ -308,6 +317,13 @@ impl App {
 
     // ── key handling ──────────────────────────────────────────────────────────
 
+    pub fn handle_paste(&mut self, text: &str) {
+        // Replace newlines with spaces so the single-line editor stays coherent
+        // but the whole paste lands as one prompt instead of N submits.
+        let flat = text.replace('\n', " ").replace('\r', "");
+        self.editor.insert_str(&flat);
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         // Global quit shortcuts
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -449,7 +465,7 @@ impl App {
                 self.cfg.model = model.clone();
                 self.entries.push(Entry::info(format!("Model → {model}")));
             }
-            _ => self.entries.push(Entry::error(format!("Unknown command. /help for list."))),
+            _ => self.entries.push(Entry::error("Unknown command. /help for list.".to_string())),
         }
     }
 
@@ -517,10 +533,8 @@ impl App {
             }
             WorkerMsg::ToolEnd { result_preview } => {
                 if let Some(e) = self.entries.last_mut() {
-                    if e.role == Role::Tool {
-                        if !result_preview.is_empty() {
-                            e.text.push_str(&format!("\n→ {result_preview}"));
-                        }
+                    if e.role == Role::Tool && !result_preview.is_empty() {
+                        e.text.push_str(&format!("\n→ {result_preview}"));
                     }
                 }
             }
@@ -934,11 +948,12 @@ pub fn run(cfg: Config, client: Client) -> std::io::Result<()> {
     // Set up panic handler to restore terminal
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = ratatui::restore();
+        ratatui::restore();
         original_hook(info);
     }));
 
     let mut terminal = ratatui::init();
+    execute!(std::io::stdout(), EnableBracketedPaste)?;
     let mut app = App::new(cfg, client);
 
     loop {
@@ -953,12 +968,14 @@ pub fn run(cfg: Config, client: Client) -> std::io::Result<()> {
 
         // Poll keyboard with 80ms timeout (gives ~12fps animation)
         if event::poll(std::time::Duration::from_millis(80))? {
-            if let Event::Key(key) = event::read()? {
-                // crossterm on Windows reports Press, Release, and Repeat —
-                // ignore everything but Press to avoid double-typing.
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key);
                 }
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                }
+                _ => {}
             }
         }
 
@@ -967,6 +984,7 @@ pub fn run(cfg: Config, client: Client) -> std::io::Result<()> {
         }
     }
 
+    execute!(std::io::stdout(), DisableBracketedPaste)?;
     ratatui::restore();
     Ok(())
 }

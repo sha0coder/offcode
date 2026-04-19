@@ -20,8 +20,8 @@ pub fn print_mascot(model: &str) {
     let ey = format!("{WHITE}{BOLD}");
     let sm = format!("{BRIGHT_GREEN}{BOLD}");
     let br = format!("{WHITE}{BOLD}");
-    let ac = format!("{BRIGHT_CYAN}");
-    let d  = format!("{DIM}");
+    let ac = BRIGHT_CYAN.to_string();
+    let d  = DIM.to_string();
     let r  = RESET;
 
     println!();

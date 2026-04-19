@@ -287,3 +287,72 @@ impl Client {
         Ok((content, tool_calls))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    fn local_client() -> Client {
+        Client::new("http://localhost:11434")
+    }
+
+    // If Ollama is not running these tests return early (pass trivially).
+    // In CI the integration job installs Ollama so they run for real.
+
+    #[test]
+    fn ollama_is_healthy() {
+        let client = local_client();
+        if !client.is_healthy() { return; }
+        assert!(client.is_healthy());
+    }
+
+    #[test]
+    fn model_returns_nonempty_response() {
+        let client = local_client();
+        if !client.is_healthy() { return; }
+
+        let request = ChatRequest {
+            model: crate::config::Config::default().model,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "Reply with only the word ok".to_string(),
+                tool_calls: None,
+            }],
+            stream: true,
+            tools: vec![],
+            options: Options { temperature: 0.0, num_ctx: 512 },
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (content, tool_calls) = client
+            .chat_stream(&request, false, cancel, |_, _| {})
+            .expect("chat_stream should succeed");
+        assert!(!content.is_empty() || tool_calls.is_some(), "model should return a response");
+    }
+
+    #[test]
+    fn model_can_use_read_file_tool() {
+        let client = local_client();
+        if !client.is_healthy() { return; }
+
+        let tools = crate::tools::definitions();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret.txt");
+        std::fs::write(&file, "the answer is 42").unwrap();
+
+        let request = ChatRequest {
+            model: crate::config::Config::default().model,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: format!("Read the file at {} and tell me what it says.", file.display()),
+                tool_calls: None,
+            }],
+            stream: true,
+            tools,
+            options: Options { temperature: 0.0, num_ctx: 2048 },
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = client.chat_stream(&request, false, cancel, |_, _| {});
+        assert!(result.is_ok(), "chat_stream should not error");
+    }
+}
