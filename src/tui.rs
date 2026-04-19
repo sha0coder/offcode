@@ -252,6 +252,7 @@ impl App {
                 "/help  show help\n\
                  /clear  clear history\n\
                  /tools  list tools\n\
+                 /model  list available models\n\
                  /model <name>  change model\n\
                  /think  toggle thinking display\n\
                  /exit or Ctrl+C  quit".into(),
@@ -279,6 +280,7 @@ impl App {
                 self.entries.push(Entry::info(format!("Thinking display: {state}")));
             }
             "/exit" | "/quit" => self.should_quit = true,
+            "/model" | "/models" => self.list_models_entry(),
             s if s.starts_with("/model ") => {
                 let model = s[7..].trim().to_string();
                 self.cfg.model = model.clone();
@@ -286,6 +288,37 @@ impl App {
             }
             _ => self.entries.push(Entry::error(format!("Unknown command. /help for list."))),
         }
+    }
+
+    fn list_models_entry(&mut self) {
+        let models = match self.client.list_models() {
+            Ok(m) => m,
+            Err(e) => {
+                self.entries.push(Entry::error(format!("list models: {e}")));
+                return;
+            }
+        };
+        if models.is_empty() {
+            self.entries.push(Entry::info(
+                "No models installed. Try `ollama pull <model>`.".into(),
+            ));
+            return;
+        }
+        let caps: Vec<crate::ollama::ModelCaps> = models
+            .iter()
+            .map(|m| self.client.model_capabilities(&m.name))
+            .collect();
+        let rows = crate::ollama::format_model_listing(&models, &caps, &self.cfg.model);
+        let mut text = String::from("");
+        for (line, is_sel) in &rows {
+            if *is_sel {
+                text.push_str(&format!("{line}  ← current\n"));
+            } else {
+                text.push_str(&format!("{line}\n"));
+            }
+        }
+        text.push_str(&format!("selected: {}", self.cfg.model));
+        self.entries.push(Entry::info(text));
     }
 
     // ── worker events ─────────────────────────────────────────────────────────

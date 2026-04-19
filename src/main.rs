@@ -158,6 +158,7 @@ fn run_repl(cfg: Config, client: Client) {
                 println!("{}", toml::to_string_pretty(&cfg).unwrap_or_default());
             }
             "/history" => print_history(&messages),
+            "/model" | "/models" => print_model_list(&client, &cfg.model),
             s if s.starts_with("/model ") => {
                 cfg.model = s[7..].trim().to_string();
                 println!("{}Model → {}{}", ui::DIM, cfg.model, ui::RESET);
@@ -344,9 +345,47 @@ fn print_repl_help() {
     println!("  {c}/clear{r}          {d}Clear history{r}");
     println!("  {c}/history{r}        {d}Show history{r}");
     println!("  {c}/tools{r}          {d}List tools{r}");
+    println!("  {c}/model{r}          {d}List available models (with capabilities){r}");
     println!("  {c}/model <name>{r}   {d}Switch model{r}");
     println!("  {c}/config{r}         {d}Show config{r}");
     println!("  {c}/exit{r}           {d}Quit{r}");
+}
+
+fn print_model_list(client: &Client, selected: &str) {
+    let models = match client.list_models() {
+        Ok(m) => m,
+        Err(e) => {
+            println!("{}Error listing models: {}{}", ui::RED, e, ui::RESET);
+            return;
+        }
+    };
+    if models.is_empty() {
+        println!("{}No models installed. Try `ollama pull <model>`.{}", ui::DIM, ui::RESET);
+        return;
+    }
+    let caps: Vec<ollama::ModelCaps> =
+        models.iter().map(|m| client.model_capabilities(&m.name)).collect();
+    let rows = ollama::format_model_listing(&models, &caps, selected);
+    println!(
+        "{}{}  tools🛠   thinking🧠   vision👁{}",
+        ui::DIM,
+        " ".repeat(2),
+        ui::RESET
+    );
+    for (line, is_sel) in &rows {
+        if *is_sel {
+            println!("{}{}{}{}", ui::BOLD, ui::BRIGHT_CYAN, line, ui::RESET);
+        } else {
+            println!("{}", line);
+        }
+    }
+    println!(
+        "{}selected: {}{}{}",
+        ui::DIM,
+        ui::BRIGHT_CYAN,
+        selected,
+        ui::RESET
+    );
 }
 
 fn print_history(messages: &[Message]) {

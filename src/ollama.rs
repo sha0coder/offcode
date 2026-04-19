@@ -47,6 +47,34 @@ pub struct Options {
     pub num_ctx: u32,
 }
 
+// ── model listing (/api/tags, /api/show) ─────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelInfo {
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TagsResponse {
+    #[serde(default)]
+    models: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShowResponse {
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ModelCaps {
+    pub tools: bool,
+    pub thinking: bool,
+    pub vision: bool,
+}
+
 // ── internal deserialization ─────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +124,91 @@ impl Client {
             .is_ok()
     }
 
+    /// Fetch the list of locally available models via /api/tags.
+    pub fn list_models(&self) -> Result<Vec<ModelInfo>, String> {
+        let url = format!("{}/api/tags", self.base);
+        let resp = self
+            .agent
+            .get(&url)
+            .call()
+            .map_err(|e| format!("Failed to fetch models: {e}"))?;
+        let body: TagsResponse = resp
+            .into_json()
+            .map_err(|e| format!("Failed to parse models: {e}"))?;
+        Ok(body.models)
+    }
+
+    /// Query /api/show for a model and extract the capability flags we care about.
+    pub fn model_capabilities(&self, name: &str) -> ModelCaps {
+        let url = format!("{}/api/show", self.base);
+        let req = serde_json::json!({ "name": name });
+        let resp = match self.agent.post(&url).send_json(&req) {
+            Ok(r) => r,
+            Err(_) => return ModelCaps::default(),
+        };
+        let show: ShowResponse = match resp.into_json() {
+            Ok(s) => s,
+            Err(_) => return ModelCaps::default(),
+        };
+        let mut caps = ModelCaps::default();
+        for c in &show.capabilities {
+            match c.as_str() {
+                "tools" => caps.tools = true,
+                "thinking" => caps.thinking = true,
+                "vision" => caps.vision = true,
+                _ => {}
+            }
+        }
+        caps
+    }
+}
+
+/// Format a size in bytes as a human-readable string.
+pub fn format_size(bytes: u64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Build a human-readable listing of models, one row per line.
+/// The selected model is marked with `●` and bolded by the caller.
+pub fn format_model_listing(
+    models: &[ModelInfo],
+    caps: &[ModelCaps],
+    selected: &str,
+) -> Vec<(String, bool)> {
+    let name_w = models.iter().map(|m| m.name.len()).max().unwrap_or(20).max(20);
+    let mut out = Vec::with_capacity(models.len());
+    for (m, c) in models.iter().zip(caps.iter()) {
+        let is_sel = m.name == selected;
+        let mark = if is_sel { "●" } else { " " };
+        let t = if c.tools { "🛠 " } else { "  " };
+        let k = if c.thinking { "🧠" } else { "  " };
+        let v = if c.vision { "👁 " } else { "  " };
+        let size = format_size(m.size);
+        let line = format!(
+            "{mark} {name:<nw$}  {size:>10}  {t} {k} {v}",
+            mark = mark,
+            name = m.name,
+            size = size,
+            t = t,
+            k = k,
+            v = v,
+            nw = name_w,
+        );
+        out.push((line, is_sel));
+    }
+    out
+}
+
+impl Client {
     /// Stream a chat response.
     ///
     /// `show_thinking` – if true, thinking tokens are also forwarded to `on_token`
