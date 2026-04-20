@@ -129,6 +129,7 @@ num_ctx = 16384
 show_thinking = false
 max_tool_iters = 30
 system_prompt = "You are offcode..."
+compact_prompt = "You are compressing the conversation above..."
 ```
 
 View current config:

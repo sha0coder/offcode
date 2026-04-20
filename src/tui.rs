@@ -225,6 +225,7 @@ enum WorkerMsg {
         args: Value,
         reply: mpsc::SyncSender<ConfirmAction>,
     },
+    CompactReady(String),
     Done,
     Error(String),
 }
@@ -272,7 +273,7 @@ impl Entry {
 // ── slash commands (used by /help and Tab completion) ────────────────────────
 
 const COMMANDS: &[&str] = &[
-    "/help", "/clear", "/reset", "/tools", "/think", "/yolo",
+    "/help", "/clear", "/reset", "/compact", "/tools", "/think", "/yolo",
     "/model", "/models", "/exit", "/quit",
 ];
 
@@ -520,6 +521,7 @@ impl App {
             "/help" => self.entries.push(Entry::info(
                 "/help  show help\n\
                  /clear  clear history\n\
+                 /compact  summarize history to shrink context\n\
                  /tools  list tools\n\
                  /model  list available models\n\
                  /model <name>  change model\n\
@@ -532,6 +534,7 @@ impl App {
                 self.history.truncate(1);
                 self.entries.push(Entry::info("History cleared.".into()));
             }
+            "/compact" => self.start_compact(),
             "/tools" => {
                 let names: Vec<String> = tools::definitions()
                     .iter()
@@ -598,6 +601,40 @@ impl App {
         }
         text.push_str(&format!("selected: {}", self.cfg.model));
         self.entries.push(Entry::info(text));
+    }
+
+    // ── /compact ──────────────────────────────────────────────────────────────
+
+    fn start_compact(&mut self) {
+        if self.mode == Mode::Generating {
+            self.entries.push(Entry::info(
+                "busy generating — try /compact after it finishes.".into(),
+            ));
+            return;
+        }
+        if self.history.len() <= 1 {
+            self.entries.push(Entry::info("nothing to compact.".into()));
+            return;
+        }
+
+        self.auto_scroll = true;
+        self.mode = Mode::Generating;
+        self.entries.push(Entry::info("Compacting conversation…".into()));
+
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        self.rx = rx;
+        self._tx = tx.clone();
+
+        let cfg = self.cfg.clone();
+        let client = self.client.clone();
+        let history = self.history.clone();
+        let show_thinking = self.cfg.show_thinking;
+        let cancel = self.cancel.clone();
+
+        std::thread::spawn(move || {
+            run_compact_worker(cfg, client, history, show_thinking, cancel, tx);
+        });
     }
 
     // ── tool confirmation ─────────────────────────────────────────────────────
@@ -667,6 +704,42 @@ impl App {
                 )));
                 self.pending_confirm = Some(PendingConfirm { name, args, reply });
                 self.auto_scroll = true;
+            }
+            WorkerMsg::CompactReady(summary) => {
+                if summary.trim().is_empty() {
+                    self.entries.push(Entry::error(
+                        "compact produced empty summary — history unchanged.".into(),
+                    ));
+                } else {
+                    let system = self.history.first().cloned().unwrap_or(Message {
+                        role: "system".to_string(),
+                        content: String::new(),
+                        tool_calls: None,
+                    });
+                    self.history = vec![
+                        system,
+                        Message {
+                            role: "user".to_string(),
+                            content: "Summary of the prior conversation (context was compacted):"
+                                .to_string(),
+                            tool_calls: None,
+                        },
+                        Message {
+                            role: "assistant".to_string(),
+                            content: summary,
+                            tool_calls: None,
+                        },
+                    ];
+                    self.entries.clear();
+                    self.entries
+                        .push(Entry::info("Context compacted.".into()));
+                }
+                if !self.cfg.no_ctx { crate::context::save(&self.history); }
+                self.mode = Mode::Input;
+                if let Some(queued) = self.queued.take() {
+                    self.editor.set(queued);
+                    self.submit();
+                }
             }
             WorkerMsg::Done => {
                 if !self.cfg.no_ctx { crate::context::save(&self.history); }
@@ -1141,6 +1214,55 @@ fn run_worker(
                 let _ = tx.send(WorkerMsg::Error(e));
                 return;
             }
+        }
+    }
+}
+
+fn run_compact_worker(
+    cfg: Config,
+    client: Client,
+    history: Vec<Message>,
+    show_thinking: bool,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::Sender<WorkerMsg>,
+) {
+    let mut msgs = history;
+    msgs.push(Message {
+        role: "user".to_string(),
+        content: cfg.compact_prompt.clone(),
+        tool_calls: None,
+    });
+
+    let request = ChatRequest {
+        model: cfg.model.clone(),
+        messages: msgs,
+        stream: true,
+        tools: vec![],
+        options: Options {
+            temperature: cfg.temperature,
+            num_ctx: cfg.num_ctx,
+        },
+    };
+
+    let tx2 = tx.clone();
+    let result = client.chat_stream(&request, show_thinking, cancel, move |token, is_think| {
+        let msg = if is_think {
+            WorkerMsg::ThinkToken(token.to_string())
+        } else {
+            WorkerMsg::Token(token.to_string())
+        };
+        let _ = tx2.send(msg);
+    });
+
+    match result {
+        Ok((content, _)) => {
+            let _ = tx.send(WorkerMsg::CompactReady(content));
+        }
+        Err(e) if e == "__cancelled__" => {
+            let _ = tx.send(WorkerMsg::Done);
+        }
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(e));
         }
     }
 }

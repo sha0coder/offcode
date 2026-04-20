@@ -6,6 +6,7 @@ pub struct Config {
     pub model: String,
     pub ollama_url: String,
     pub system_prompt: String,
+    pub compact_prompt: String,
     pub temperature: f64,
     pub num_ctx: u32,
     pub show_thinking: bool,
@@ -34,6 +35,7 @@ impl Default for Config {
                 "Be concise, accurate, and practical. ",
                 "At the start of every session, always run list_dir on '.' first to understand the project structure."
             ).to_string(),
+            compact_prompt: crate::COMPACT_PROMPT.to_string(),
             temperature: 0.6,
             num_ctx: 16384,
             show_thinking: false,

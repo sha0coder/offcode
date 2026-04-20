@@ -164,6 +164,7 @@ fn run_repl(cfg: Config, client: Client) {
                 messages.truncate(1);
                 println!("{}History cleared.{}", ui::DIM, ui::RESET);
             }
+            "/compact" => run_compact(&cfg, &client, &mut messages),
             "/tools" => tools::print_list(),
             "/yolo" => {
                 cfg.yolo = !cfg.yolo;
@@ -340,7 +341,81 @@ fn run_turn(cfg: &Config, client: &Client, messages: &mut Vec<Message>, input: &
     }
 }
 
+// ── /compact (REPL implementation; TUI has its own async worker) ─────────────
+
+fn run_compact(cfg: &Config, client: &Client, messages: &mut Vec<Message>) {
+    if messages.len() <= 1 {
+        println!("{}Nothing to compact.{}", ui::DIM, ui::RESET);
+        return;
+    }
+    let mut msgs = messages.clone();
+    msgs.push(Message {
+        role: "user".to_string(),
+        content: cfg.compact_prompt.clone(),
+        tool_calls: None,
+    });
+    let request = ChatRequest {
+        model: cfg.model.clone(),
+        messages: msgs,
+        stream: true,
+        tools: vec![],
+        options: Options {
+            temperature: cfg.temperature,
+            num_ctx: cfg.num_ctx,
+        },
+    };
+    print!("{}", ui::DIM);
+    io::stdout().flush().ok();
+    let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let result = client.chat_stream(&request, false, no_cancel, |token, _is_think| {
+        print!("{token}");
+        io::stdout().flush().ok();
+    });
+    println!("{}", ui::RESET);
+    match result {
+        Ok((summary, _)) if !summary.trim().is_empty() => {
+            let system = messages.first().cloned().expect("system prompt");
+            *messages = vec![
+                system,
+                Message {
+                    role: "user".to_string(),
+                    content: "Summary of the prior conversation (context was compacted):"
+                        .to_string(),
+                    tool_calls: None,
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: summary,
+                    tool_calls: None,
+                },
+            ];
+            if !cfg.no_ctx { context::save(messages); }
+            println!("{}Context compacted.{}", ui::DIM, ui::RESET);
+        }
+        Ok(_) => {
+            println!("{}Compact produced empty summary; history unchanged.{}", ui::YELLOW, ui::RESET);
+        }
+        Err(e) => {
+            println!("{}Compact error: {}{}", ui::RED, e, ui::RESET);
+        }
+    }
+}
+
 // ── shared helper (also used by tui.rs) ──────────────────────────────────────
+
+pub const COMPACT_PROMPT: &str = "\
+You are compressing the conversation above so work can continue in a smaller context.\n\
+Produce ONE concise summary (plain prose + terse bullets, no preamble, no closing remarks).\n\
+It must preserve, and ONLY preserve, what is needed to keep working:\n\
+  • The user's current task and overall goal.\n\
+  • Decisions made, constraints agreed on, and conclusions reached.\n\
+  • Concrete artifacts: file paths, function/type names, commands, URLs, identifiers.\n\
+  • Relevant contents already read from files (keep exact signatures, key code snippets).\n\
+  • Outstanding TODOs, unresolved questions, and the next concrete step.\n\
+  • User preferences or corrections given during the conversation.\n\
+Drop tool-call mechanics, chit-chat, retries, dead ends, and anything already superseded.\n\
+Do not ask questions. Do not address the user. Write the summary as notes for your future self.\n\
+Output the summary only.";
 
 pub fn build_system_prompt(cfg: &Config) -> String {
     let cwd = std::env::current_dir()
@@ -397,6 +472,7 @@ fn print_repl_help() {
     println!("{b}Commands{r}");
     println!("  {c}/help{r}           {d}This help{r}");
     println!("  {c}/clear{r}          {d}Clear history{r}");
+    println!("  {c}/compact{r}        {d}Summarize history to shrink context{r}");
     println!("  {c}/history{r}        {d}Show history{r}");
     println!("  {c}/tools{r}          {d}List tools{r}");
     println!("  {c}/model{r}          {d}List available models (with capabilities){r}");
