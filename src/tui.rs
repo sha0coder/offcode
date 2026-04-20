@@ -61,6 +61,13 @@ impl LineEdit {
             match key.code {
                 KeyCode::Char('p') => { self.history_prev(); return KeyOutcome::Handled; }
                 KeyCode::Char('n') => { self.history_next(); return KeyOutcome::Handled; }
+                KeyCode::Char('a') => { self.cursor = 0; return KeyOutcome::Handled; }
+                KeyCode::Char('e') => { self.cursor = self.input.len(); return KeyOutcome::Handled; }
+                KeyCode::Char('b') => { self.move_left(); return KeyOutcome::Handled; }
+                KeyCode::Char('f') => { self.move_right(); return KeyOutcome::Handled; }
+                KeyCode::Char('w') => { self.kill_word_back(); return KeyOutcome::Handled; }
+                KeyCode::Char('u') => { self.kill_to_start(); return KeyOutcome::Handled; }
+                KeyCode::Char('k') => { self.kill_to_end(); return KeyOutcome::Handled; }
                 _ => {}
             }
         }
@@ -80,20 +87,8 @@ impl LineEdit {
                 if self.cursor < self.input.len() { self.input.remove(self.cursor); }
                 KeyOutcome::Handled
             }
-            KeyCode::Left => {
-                if self.cursor > 0 {
-                    self.cursor = self.input[..self.cursor]
-                        .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
-                }
-                KeyOutcome::Handled
-            }
-            KeyCode::Right => {
-                if self.cursor < self.input.len() {
-                    let c = self.input[self.cursor..].chars().next().unwrap();
-                    self.cursor += c.len_utf8();
-                }
-                KeyOutcome::Handled
-            }
+            KeyCode::Left => { self.move_left(); KeyOutcome::Handled }
+            KeyCode::Right => { self.move_right(); KeyOutcome::Handled }
             KeyCode::Home => { self.cursor = 0; KeyOutcome::Handled }
             KeyCode::End => { self.cursor = self.input.len(); KeyOutcome::Handled }
             KeyCode::Char(c) => {
@@ -136,6 +131,40 @@ impl LineEdit {
         self.input.insert_str(self.cursor, s);
         self.cursor += s.len();
         self.history_idx = None;
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.input[..self.cursor]
+                .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+        }
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor < self.input.len() {
+            let c = self.input[self.cursor..].chars().next().unwrap();
+            self.cursor += c.len_utf8();
+        }
+    }
+
+    fn kill_word_back(&mut self) {
+        let head = &self.input[..self.cursor];
+        let boundaries: Vec<(usize, char)> = head.char_indices().collect();
+        let mut n = boundaries.len();
+        while n > 0 && boundaries[n - 1].1.is_whitespace() { n -= 1; }
+        while n > 0 && !boundaries[n - 1].1.is_whitespace() { n -= 1; }
+        let start = boundaries.get(n).map(|(i, _)| *i).unwrap_or(self.cursor);
+        self.input.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    fn kill_to_start(&mut self) {
+        self.input.replace_range(..self.cursor, "");
+        self.cursor = 0;
+    }
+
+    fn kill_to_end(&mut self) {
+        self.input.truncate(self.cursor);
     }
 
     fn history_prev(&mut self) {
