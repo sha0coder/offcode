@@ -1,6 +1,17 @@
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
+
+// ── SSH session state ─────────────────────────────────────────────────────────
+
+struct SshState {
+    host: String,
+    user: String,
+    socket: String,
+}
+
+static SSH: Mutex<Option<SshState>> = Mutex::new(None);
 
 // ── tool schema definitions ──────────────────────────────────────────────────
 
@@ -24,7 +35,7 @@ pub fn definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write (or overwrite) a file with the given content. Creates parent dirs automatically.",
+                "description": "Write (or overwrite) a file with the given content. Creates parent dirs automatically. 'path' is REQUIRED — always supply a filename such as 'notes.md' or 'src/foo.rs'.",
                 "parameters": {
                     "type": "object",
                     "required": ["path", "content"],
@@ -121,6 +132,49 @@ pub fn definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "ssh_connect",
+                "description": "Connect to a remote host via SSH. Subsequent ssh_exec calls run on that host.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["host", "user", "key"],
+                    "properties": {
+                        "host": { "type": "string", "description": "Hostname or IP address" },
+                        "user": { "type": "string", "description": "SSH username" },
+                        "key":  { "type": "string", "description": "Path to the private key file (-i)" },
+                        "port": { "type": "integer", "description": "SSH port (default 22)" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "ssh_exec",
+                "description": "Execute a command on the currently connected remote SSH host.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": { "type": "string", "description": "Shell command to run on the remote host" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "ssh_disconnect",
+                "description": "Close the current SSH connection.",
+                "parameters": {
+                    "type": "object",
+                    "required": [],
+                    "properties": {}
+                }
+            }
+        }),
     ]
 }
 
@@ -153,6 +207,9 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
         "write_file" => {
             let path = sarg(&args, "path");
             let content = sarg(&args, "content");
+            if path.is_empty() {
+                return "Error: 'path' argument is required and must not be empty. Provide a filename like 'notes.md' or 'src/foo.rs'.".to_string();
+            }
             let old_content = std::fs::read_to_string(&path).unwrap_or_default();
             if let Some(parent) = Path::new(&path).parent() {
                 if !parent.as_os_str().is_empty() {
@@ -176,8 +233,8 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
             match Command::new("sh").arg("-c").arg(&cmd).output() {
                 Ok(out) => {
                     let code = out.status.code().unwrap_or(-1);
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+                    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
                     let mut result = format!("exit: {code}\n");
                     if !stdout.is_empty() {
                         result.push_str("stdout:\n");
@@ -286,6 +343,102 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
             }
         }
 
+        "ssh_connect" => {
+            let host = sarg(&args, "host");
+            let user = sarg(&args, "user");
+            let key  = sarg(&args, "key");
+            let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(22);
+            let socket = format!("/tmp/offcode-ssh-{}", std::process::id());
+
+            // Disconnect any existing session first
+            if let Ok(mut g) = SSH.lock() {
+                if let Some(old) = g.take() {
+                    let _ = Command::new("ssh")
+                        .args(["-S", &old.socket, "-O", "exit",
+                               &format!("{}@{}", old.user, old.host)])
+                        .output();
+                }
+            }
+
+            let status = Command::new("ssh")
+                .args([
+                    "-i", &key,
+                    "-p", &port.to_string(),
+                    "-M", "-S", &socket,
+                    "-fN",
+                    "-o", "StrictHostKeyChecking=accept-new",
+                    "-o", "ConnectTimeout=10",
+                    "-o", "LogLevel=QUIET",
+                    "-o", "PermitLocalCommand=no",
+                    &format!("{user}@{host}"),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    if let Ok(mut g) = SSH.lock() {
+                        *g = Some(SshState { host: host.clone(), user: user.clone(), socket: socket.clone() });
+                    }
+                    // Fetch MOTD as plain text so it appears safely in the TUI
+                    let motd = Command::new("ssh")
+                        .args(["-S", &socket, &format!("{user}@{host}"),
+                               "cat /etc/motd /run/motd.dynamic 2>/dev/null; true"])
+                        .output()
+                        .map(|o| strip_ansi(&String::from_utf8_lossy(&o.stdout)))
+                        .unwrap_or_default();
+                    let motd = motd.trim();
+                    if motd.is_empty() {
+                        format!("Connected to {user}@{host}:{port}")
+                    } else {
+                        format!("Connected to {user}@{host}:{port}\n\n{motd}")
+                    }
+                }
+                Ok(s) => format!("SSH connect failed (exit {})", s.code().unwrap_or(-1)),
+                Err(e) => format!("SSH error: {e}"),
+            }
+        }
+
+        "ssh_exec" => {
+            let cmd = sarg(&args, "command");
+            let guard = SSH.lock().unwrap();
+            let state = match guard.as_ref() {
+                Some(s) => s,
+                None => return "Not connected to any SSH host. Use ssh_connect first.".to_string(),
+            };
+            let out = Command::new("ssh")
+                .args(["-S", &state.socket, &format!("{}@{}", state.user, state.host), &cmd])
+                .output();
+            match out {
+                Ok(out) => {
+                    let code = out.status.code().unwrap_or(-1);
+                    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+                    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+                    let mut result = format!("exit: {code}\n");
+                    if !stdout.is_empty() { result.push_str(&format!("stdout:\n{stdout}")); }
+                    if !stderr.is_empty()  { result.push_str(&format!("stderr:\n{stderr}")); }
+                    if stdout.is_empty() && stderr.is_empty() { result.push_str("(no output)"); }
+                    result
+                }
+                Err(e) => format!("SSH exec error: {e}"),
+            }
+        }
+
+        "ssh_disconnect" => {
+            let mut guard = SSH.lock().unwrap();
+            match guard.take() {
+                Some(state) => {
+                    let _ = Command::new("ssh")
+                        .args(["-S", &state.socket, "-O", "exit",
+                               &format!("{}@{}", state.user, state.host)])
+                        .output();
+                    format!("Disconnected from {}@{}", state.user, state.host)
+                }
+                None => "Not connected to any SSH host.".to_string(),
+            }
+        }
+
         _ => format!("Unknown tool '{name}'"),
     }
 }
@@ -299,8 +452,11 @@ pub fn print_list() {
         ("list_dir",     "List directory contents"),
         ("search_files", "Search pattern in files recursively"),
         ("create_dir",   "Create directories (mkdir -p)"),
-        ("delete_path",  "Delete a file or empty directory"),
-        ("path_info",    "File/directory metadata"),
+        ("delete_path",     "Delete a file or empty directory"),
+        ("path_info",       "File/directory metadata"),
+        ("ssh_connect",     "Connect to a remote host via SSH"),
+        ("ssh_exec",        "Run a command on the connected SSH host"),
+        ("ssh_disconnect",  "Disconnect from the current SSH host"),
     ];
     println!("{BOLD}Available tools:{RESET}");
     for (name, desc) in &tools {
@@ -352,6 +508,42 @@ fn check_command_paths(cmd: &str) -> Result<(), String> {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Strip ANSI/VT escape sequences so remote output doesn't corrupt the TUI.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next(); // consume '['
+                    // consume until a byte in 0x40–0x7E (the final byte)
+                    for ch in chars.by_ref() {
+                        if ch.is_ascii_alphabetic() || matches!(ch, '~' | '@') {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    // OSC: consume until BEL or ST
+                    for ch in chars.by_ref() {
+                        if ch == '\x07' || ch == '\u{9C}' { break; }
+                        if ch == '\x1b' {
+                            if chars.peek() == Some(&'\\') { chars.next(); }
+                            break;
+                        }
+                    }
+                }
+                _ => { chars.next(); } // other ESC sequences: skip next char
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
 
 fn sarg(args: &Value, key: &str) -> String {
     args.get(key)
