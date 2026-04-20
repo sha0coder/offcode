@@ -268,7 +268,7 @@ fn run_turn(cfg: &Config, client: &Client, messages: &mut Vec<Message>, input: &
                     tool_calls: Some(calls.clone()),
                 });
 
-                for (call, action) in calls.iter().zip(actions.into_iter()) {
+                for (call, action) in calls.iter().zip(actions) {
                     let name = &call.function.name;
                     let args = &call.function.arguments;
 

@@ -1063,7 +1063,7 @@ fn run_worker(
                 history.push(asst_msg.clone());
                 let _ = tx.send(WorkerMsg::AddMessage(asst_msg));
 
-                for (call, action) in calls.iter().zip(actions.into_iter()) {
+                for (call, action) in calls.iter().zip(actions) {
                     let name = &call.function.name;
                     let args = &call.function.arguments;
 
