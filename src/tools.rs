@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 
 // ── SSH session state ─────────────────────────────────────────────────────────
@@ -12,6 +13,82 @@ struct SshState {
 }
 
 static SSH: Mutex<Option<SshState>> = Mutex::new(None);
+
+// ── radare2 built-in skill ────────────────────────────────────────────────────
+
+const R2_SKILL: &str = "\
+# Radare2 expert
+
+You are an expert reverse engineer using radare2. Follow these guidelines:
+
+## Session workflow
+1. After r2_open, run `aaa` to analyze the binary (skip with no_analysis=true for raw hex work).
+2. Use `afl` to list functions, `s <addr|name>` to seek, `pdf` to disassemble the current function.
+3. Prefer JSON output (`-j` flag) when you need to parse structured data: `aflj`, `pdj`, etc.
+
+## Essential commands
+- `i` / `ii` / `il` — binary info / imports / libraries
+- `afl` — list all functions
+- `pdf` / `pdf @ sym.main` — disassemble function at current seek / at symbol
+- `s addr` — seek to address or symbol name
+- `px N` / `pxw N` — hex dump N bytes / words
+- `ps @ addr` — print string at address
+- `xrefs @ addr` — cross-references to address
+- `afvd` — list local variables of current function
+- `axt addr` — find references to address
+- `iz` / `izz` — strings in data section / whole binary
+
+## Patching (requires write=true)
+- `wa <asm>` — write assembly at current seek, e.g. `wa nop`
+- `wx <hex>` — write raw hex bytes, e.g. `wx 9090`
+- `wv4 <val>` — write 4-byte value
+
+## Tips
+- Chain commands with `;`: `s main; pdf`
+- Use `~pattern` to grep output: `afl~main`
+- Radare2 addresses are in hex: `0x401000`
+- Always close the session with r2_close when done.
+";
+
+// ── radare2 session ───────────────────────────────────────────────────────────
+
+struct R2Session {
+    child:  Child,
+    stdin:  ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+static R2: Mutex<Option<R2Session>> = Mutex::new(None);
+
+// ── browser state ────────────────────────────────────────────────────────────
+
+struct FormField {
+    name:  String,
+    ftype: String,
+    value: String,
+}
+
+struct HtmlForm {
+    action: String,
+    method: String,
+    fields: Vec<FormField>,
+}
+
+struct BrowserState {
+    url:        String,
+    cookie_jar: String,   // "name=val; name2=val2" ready to send
+    forms:      Vec<HtmlForm>,
+}
+
+static BROWSER: Mutex<Option<BrowserState>> = Mutex::new(None);
+
+// ── active skill ──────────────────────────────────────────────────────────────
+
+static SKILL: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn active_skill() -> Option<String> {
+    SKILL.lock().ok()?.clone()
+}
 
 // ── tool schema definitions ──────────────────────────────────────────────────
 
@@ -159,6 +236,106 @@ pub fn definitions() -> Vec<Value> {
                     "required": ["command"],
                     "properties": {
                         "command": { "type": "string", "description": "Shell command to run on the remote host" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "r2_open",
+                "description": "Open a radare2 session on a binary file. Must be called before r2_cmd. Opens an interactive r2 process that keeps state (seek position, analysis, flags) across commands.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["file"],
+                    "properties": {
+                        "file":        { "type": "string",  "description": "Path to the binary file to open" },
+                        "write":       { "type": "boolean", "description": "Open in write mode (-w) for patching" },
+                        "no_analysis": { "type": "boolean", "description": "Skip analysis (-n), useful for raw hex editing" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "r2_cmd",
+                "description": "Send one or more radare2 commands to the open session and return the output. Separate multiple commands with semicolons or newlines.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": { "type": "string", "description": "r2 command(s) to execute, e.g. 'aaa' or 'pdf @ main' or 's 0x1234; pd 20'" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "r2_close",
+                "description": "Close the current radare2 session.",
+                "parameters": {
+                    "type": "object",
+                    "required": [],
+                    "properties": {}
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "browser_navigate",
+                "description": "Navigate to an HTTP/HTTPS URL. Maintains cookies across calls. Returns the page as plain text plus a summary of any HTML forms found (index, action, fields).",
+                "parameters": {
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {
+                        "url": { "type": "string", "description": "Full URL to navigate to" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "browser_fill",
+                "description": "Fill a field in the current page's form before submitting. Call once per field.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["field", "value"],
+                    "properties": {
+                        "field":      { "type": "string",  "description": "Field name (the 'name' attribute of the input)" },
+                        "value":      { "type": "string",  "description": "Value to set" },
+                        "form_index": { "type": "integer", "description": "Which form to target (0-based, default 0)" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "browser_submit",
+                "description": "Submit the current form (GET or POST). Returns the resulting page as plain text plus any new forms.",
+                "parameters": {
+                    "type": "object",
+                    "required": [],
+                    "properties": {
+                        "form_index": { "type": "integer", "description": "Which form to submit (0-based, default 0)" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "load_skill",
+                "description": "Load a skill from the skills/ folder. The skill's content is added to the system prompt for the rest of the session, giving you specialized instructions or knowledge. Use list_dir on 'skills/' to see what skills are available.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "name": { "type": "string", "description": "Skill name without extension, e.g. 'python' to load skills/python.md" }
                     }
                 }
             }
@@ -468,6 +645,221 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
             }
         }
 
+        "load_skill" => {
+            let name = sarg(&args, "name");
+            if name.is_empty() {
+                return "Error: 'name' is required".to_string();
+            }
+            let name = name.trim_end_matches(".md");
+            let path = format!("skills/{name}.md");
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    if let Ok(mut g) = SKILL.lock() {
+                        *g = Some(content.clone());
+                    }
+                    format!("Skill '{name}' loaded. Its instructions are now active in your system prompt.")
+                }
+                Err(e) => format!("Could not load skill '{name}' from '{path}': {e}"),
+            }
+        }
+
+        "r2_open" => {
+            let file        = sarg(&args, "file");
+            let write       = args.get("write").and_then(|v| v.as_bool()).unwrap_or(false);
+            let no_analysis = args.get("no_analysis").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if file.is_empty() { return "Error: 'file' is required".to_string(); }
+
+            // Close any existing session first
+            if let Ok(mut g) = R2.lock() {
+                if let Some(mut old) = g.take() {
+                    let _ = old.stdin.write_all(b"q\n");
+                    let _ = old.child.wait();
+                }
+            }
+
+            let mut cmd = Command::new("r2");
+            if write       { cmd.arg("-w"); }
+            if no_analysis { cmd.arg("-n"); }
+            cmd.arg("-q0").arg(&file)   // -q0: quiet + no banner, still interactive
+               .stdin(Stdio::piped())
+               .stdout(Stdio::piped())
+               .stderr(Stdio::null());
+
+            match cmd.spawn() {
+                Err(e) => format!("Failed to launch r2: {e}"),
+                Ok(mut child) => {
+                    let stdin  = child.stdin.take().unwrap();
+                    let stdout = BufReader::new(child.stdout.take().unwrap());
+                    let mut session = R2Session { child, stdin, stdout };
+                    // Drain the initial prompt/banner
+                    r2_drain(&mut session.stdout);
+                    let mode = match (write, no_analysis) {
+                        (true, true)  => " [-w -n]",
+                        (true, false) => " [-w]",
+                        (false, true) => " [-n]",
+                        _             => "",
+                    };
+                    if let Ok(mut g) = R2.lock() { *g = Some(session); }
+
+                    // Auto-load r2 skill: prefer skills/radare2.md, fall back to built-in
+                    let skill_content = std::fs::read_to_string("skills/radare2.md")
+                        .unwrap_or_else(|_| R2_SKILL.to_string());
+                    if let Ok(mut g) = SKILL.lock() { *g = Some(skill_content); }
+
+                    format!("r2 session opened on '{file}'{mode}. Use r2_cmd to run commands.")
+                }
+            }
+        }
+
+        "r2_cmd" => {
+            let command = sarg(&args, "command");
+            if command.is_empty() { return "Error: 'command' is required".to_string(); }
+            match R2.lock() {
+                Ok(mut g) => match g.as_mut() {
+                    None => "No r2 session open. Use r2_open first.".to_string(),
+                    Some(session) => {
+                        // Send command(s) followed by sentinel
+                        let payload = format!("{command}\n?e --OFFCODE--\n");
+                        if let Err(e) = session.stdin.write_all(payload.as_bytes()) {
+                            return format!("r2 write error: {e}");
+                        }
+                        let _ = session.stdin.flush();
+                        // Read lines until sentinel
+                        let mut out = String::new();
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            match session.stdout.read_line(&mut line) {
+                                Ok(0) => { out.push_str("[r2 process ended]"); break; }
+                                Ok(_) => {
+                                    if line.trim() == "--OFFCODE--" { break; }
+                                    out.push_str(&line);
+                                }
+                                Err(e) => { out.push_str(&format!("[read error: {e}]")); break; }
+                            }
+                        }
+                        if out.is_empty() { "(no output)".to_string() } else { out }
+                    }
+                },
+                Err(_) => "r2 lock error".to_string(),
+            }
+        }
+
+        "r2_close" => {
+            match R2.lock() {
+                Ok(mut g) => match g.take() {
+                    None => "No r2 session open.".to_string(),
+                    Some(mut session) => {
+                        let _ = session.stdin.write_all(b"q\n");
+                        let _ = session.child.wait();
+                        "r2 session closed.".to_string()
+                    }
+                },
+                Err(_) => "r2 lock error".to_string(),
+            }
+        }
+
+        "browser_navigate" => {
+            let url = sarg(&args, "url");
+            if url.is_empty() { return "Error: 'url' is required".to_string(); }
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return "Error: URL must start with http:// or https://".to_string();
+            }
+            let cookie_jar = BROWSER.lock().ok()
+                .and_then(|g| g.as_ref().map(|b| b.cookie_jar.clone()))
+                .unwrap_or_default();
+            match browser_get(&url, &cookie_jar) {
+                Ok((body, new_cookies, _)) => {
+                    let content = strip_html(&body);
+                    let forms   = parse_forms(&body);
+                    let summary = forms_summary(&forms);
+                    let jar     = merge_cookies(&cookie_jar, &new_cookies);
+                    if let Ok(mut g) = BROWSER.lock() {
+                        *g = Some(BrowserState { url, cookie_jar: jar, forms });
+                    }
+                    format!("{content}\n\n{summary}")
+                }
+                Err(e) => format!("Navigation failed: {e}"),
+            }
+        }
+
+        "browser_fill" => {
+            let field      = sarg(&args, "field");
+            let value      = sarg(&args, "value");
+            let form_index = args.get("form_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            if field.is_empty() { return "Error: 'field' is required".to_string(); }
+            match BROWSER.lock() {
+                Ok(mut g) => match g.as_mut() {
+                    None => "No page loaded. Use browser_navigate first.".to_string(),
+                    Some(state) => match state.forms.get_mut(form_index) {
+                        None => format!("No form at index {form_index}."),
+                        Some(form) => {
+                            if let Some(f) = form.fields.iter_mut().find(|f| f.name == field) {
+                                f.value = value.clone();
+                                format!("Set '{field}' = '{value}'")
+                            } else {
+                                // Field not present yet — add it (some forms generate fields dynamically)
+                                form.fields.push(FormField { name: field.clone(), ftype: "text".to_string(), value: value.clone() });
+                                format!("Added '{field}' = '{value}'")
+                            }
+                        }
+                    },
+                },
+                Err(_) => "Browser state lock error".to_string(),
+            }
+        }
+
+        "browser_submit" => {
+            let form_index = args.get("form_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let (base_url, cookie_jar, action, method, body_pairs) = {
+                match BROWSER.lock() {
+                    Ok(g) => match g.as_ref() {
+                        None => return "No page loaded. Use browser_navigate first.".to_string(),
+                        Some(state) => match state.forms.get(form_index) {
+                            None => return format!("No form at index {form_index}."),
+                            Some(form) => {
+                                let pairs: Vec<(String, String)> = form.fields.iter()
+                                    .filter(|f| f.ftype != "submit")
+                                    .map(|f| (f.name.clone(), f.value.clone()))
+                                    .collect();
+                                (state.url.clone(), state.cookie_jar.clone(), form.action.clone(), form.method.clone(), pairs)
+                            }
+                        },
+                    },
+                    Err(_) => return "Browser state lock error".to_string(),
+                }
+            };
+
+            let action_url = resolve_url(&base_url, &action);
+            let encoded = body_pairs.iter()
+                .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+
+            let result = if method == "post" {
+                browser_post(&action_url, &cookie_jar, &encoded)
+            } else {
+                let url = if encoded.is_empty() { action_url.clone() }
+                          else { format!("{action_url}?{encoded}") };
+                browser_get(&url, &cookie_jar)
+            };
+
+            match result {
+                Ok((body, new_cookies, final_url)) => {
+                    let content = strip_html(&body);
+                    let forms   = parse_forms(&body);
+                    let summary = forms_summary(&forms);
+                    let jar     = merge_cookies(&cookie_jar, &new_cookies);
+                    if let Ok(mut g) = BROWSER.lock() {
+                        *g = Some(BrowserState { url: final_url, cookie_jar: jar, forms });
+                    }
+                    format!("{content}\n\n{summary}")
+                }
+                Err(e) => format!("Submit failed: {e}"),
+            }
+        }
+
         "fetch_url" => {
             let url = sarg(&args, "url");
             if url.is_empty() {
@@ -526,6 +918,13 @@ pub fn print_list() {
         ("ssh_connect",     "Connect to a remote host via SSH"),
         ("ssh_exec",        "Run a command on the connected SSH host"),
         ("ssh_disconnect",  "Disconnect from the current SSH host"),
+        ("r2_open",          "Open a radare2 session on a binary (-w write, -n no-analysis)"),
+        ("r2_cmd",           "Send command(s) to the open r2 session"),
+        ("r2_close",         "Close the current r2 session"),
+        ("browser_navigate", "Navigate to a URL, get page text + forms"),
+        ("browser_fill",    "Fill a form field on the current page"),
+        ("browser_submit",  "Submit the current form (GET or POST)"),
+        ("load_skill",      "Load a skill from skills/<name>.md into the system prompt"),
         ("web_search",      "Search the web via DuckDuckGo (no API key needed)"),
         ("fetch_url",       "Fetch and read any HTTP/HTTPS URL as plain text"),
     ];
@@ -611,6 +1010,191 @@ fn strip_ansi(s: &str) -> String {
             }
         } else {
             out.push(c);
+        }
+    }
+    out
+}
+
+// ── radare2 helpers ───────────────────────────────────────────────────────────
+
+// Drain any initial output (banner/prompt) with a short timeout via non-blocking read
+fn r2_drain(stdout: &mut BufReader<std::process::ChildStdout>) {
+    // r2 -q0 prints a null byte as prompt; consume everything available briefly
+    let mut line = String::new();
+    // Read until the null-byte prompt line or first empty read
+    for _ in 0..32 {
+        line.clear();
+        match stdout.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if line.contains('\0') => break,
+            _ => {}
+        }
+    }
+}
+
+// ── browser helpers ───────────────────────────────────────────────────────────
+
+fn browser_get(url: &str, cookies: &str) -> Result<(String, Vec<String>, String), String> {
+    let mut req = ureq::get(url).set("User-Agent", "Mozilla/5.0 (compatible; offcode/1.0)");
+    if !cookies.is_empty() { req = req.set("Cookie", cookies); }
+    req.call()
+        .map_err(|e| e.to_string())
+        .and_then(|resp| {
+            let cookie = resp.header("set-cookie").unwrap_or("").to_string();
+            let final_url = resp.get_url().to_string();
+            resp.into_string()
+                .map(|body| (body, if cookie.is_empty() { vec![] } else { vec![cookie] }, final_url))
+                .map_err(|e| e.to_string())
+        })
+}
+
+fn browser_post(url: &str, cookies: &str, body: &str) -> Result<(String, Vec<String>, String), String> {
+    let mut req = ureq::post(url)
+        .set("User-Agent", "Mozilla/5.0 (compatible; offcode/1.0)")
+        .set("Content-Type", "application/x-www-form-urlencoded");
+    if !cookies.is_empty() { req = req.set("Cookie", cookies); }
+    req.send_string(body)
+        .map_err(|e| e.to_string())
+        .and_then(|resp| {
+            let cookie = resp.header("set-cookie").unwrap_or("").to_string();
+            let final_url = resp.get_url().to_string();
+            resp.into_string()
+                .map(|b| (b, if cookie.is_empty() { vec![] } else { vec![cookie] }, final_url))
+                .map_err(|e| e.to_string())
+        })
+}
+
+fn merge_cookies(jar: &str, new: &[String]) -> String {
+    let mut pairs: Vec<(String, String)> = jar.split("; ")
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let mut it = s.splitn(2, '=');
+            Some((it.next()?.trim().to_string(), it.next().unwrap_or("").to_string()))
+        })
+        .collect();
+
+    for set_cookie in new {
+        let pair = set_cookie.split(';').next().unwrap_or("").trim();
+        if pair.is_empty() { continue; }
+        let mut it = pair.splitn(2, '=');
+        let name  = it.next().unwrap_or("").trim().to_string();
+        let value = it.next().unwrap_or("").to_string();
+        if let Some(existing) = pairs.iter_mut().find(|(n, _)| n == &name) {
+            existing.1 = value;
+        } else {
+            pairs.push((name, value));
+        }
+    }
+
+    pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; ")
+}
+
+fn resolve_url(base: &str, href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return href.to_string();
+    }
+    if href.starts_with("//") {
+        let scheme = if base.starts_with("https") { "https" } else { "http" };
+        return format!("{scheme}:{href}");
+    }
+    // Extract origin from base
+    if let Some(after_scheme) = base.splitn(2, "://").nth(1) {
+        let origin_end = after_scheme.find('/').map(|i| i + base.find("://").unwrap_or(0) + 3).unwrap_or(base.len());
+        let origin = &base[..origin_end];
+        if href.starts_with('/') {
+            return format!("{origin}{href}");
+        }
+        // relative path: join with base directory
+        let base_dir = base.rfind('/').map(|i| &base[..=i]).unwrap_or(base);
+        return format!("{base_dir}{href}");
+    }
+    href.to_string()
+}
+
+fn parse_forms(html: &str) -> Vec<HtmlForm> {
+    let mut forms = Vec::new();
+    let lower = html.to_lowercase();
+    let mut pos = 0;
+
+    while let Some(rel) = lower[pos..].find("<form") {
+        let start = pos + rel;
+        let tag_end = html[start..].find('>').map(|i| start + i + 1).unwrap_or(html.len());
+        let tag = &html[start..tag_end];
+        let action = extract_attr(tag, "action").unwrap_or_default();
+        let method = extract_attr(tag, "method").unwrap_or_else(|| "get".to_string()).to_lowercase();
+
+        let form_end = lower[tag_end..].find("</form>").map(|i| tag_end + i).unwrap_or(html.len());
+        let body = &html[tag_end..form_end];
+        let fields = parse_inputs(body);
+
+        forms.push(HtmlForm { action, method, fields });
+        pos = form_end + 7;
+        if pos >= html.len() { break; }
+    }
+    forms
+}
+
+fn parse_inputs(html: &str) -> Vec<FormField> {
+    let mut fields = Vec::new();
+    let lower = html.to_lowercase();
+    let mut pos = 0;
+
+    // <input ...>
+    while let Some(rel) = lower[pos..].find("<input") {
+        let start = pos + rel;
+        let end = html[start..].find('>').map(|i| start + i + 1).unwrap_or(html.len());
+        let tag = &html[start..end];
+        let name  = extract_attr(tag, "name").unwrap_or_default();
+        let ftype = extract_attr(tag, "type").unwrap_or_else(|| "text".to_string()).to_lowercase();
+        let value = extract_attr(tag, "value").unwrap_or_default();
+        if !name.is_empty() {
+            fields.push(FormField { name, ftype, value });
+        }
+        pos = end;
+        if pos >= html.len() { break; }
+    }
+
+    // <textarea name="...">content</textarea>
+    let mut pos2 = 0;
+    while let Some(rel) = lower[pos2..].find("<textarea") {
+        let start = pos2 + rel;
+        let gt = html[start..].find('>').map(|i| start + i + 1).unwrap_or(html.len());
+        let tag = &html[start..gt];
+        let name = extract_attr(tag, "name").unwrap_or_default();
+        let end  = lower[gt..].find("</textarea>").map(|i| gt + i).unwrap_or(gt);
+        let value = html_text(&html[gt..end]);
+        if !name.is_empty() {
+            fields.push(FormField { name, ftype: "textarea".to_string(), value });
+        }
+        pos2 = end + 11;
+        if pos2 >= html.len() { break; }
+    }
+
+    fields
+}
+
+fn forms_summary(forms: &[HtmlForm]) -> String {
+    if forms.is_empty() { return String::new(); }
+    let mut out = String::from("── Forms ──\n");
+    for (i, form) in forms.iter().enumerate() {
+        out.push_str(&format!("[{i}] {} {} {}\n", form.method.to_uppercase(), form.action, ""));
+        for f in &form.fields {
+            if f.ftype == "hidden" { continue; }
+            let val = if f.value.is_empty() { String::new() } else { format!(" = \"{}\"", f.value) };
+            out.push_str(&format!("    {} ({}){}\n", f.name, f.ftype, val));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out

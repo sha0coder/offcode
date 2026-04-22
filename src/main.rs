@@ -430,12 +430,17 @@ pub fn build_system_prompt(cfg: &Config) -> String {
         ""
     };
 
+    let skill_section = tools::active_skill()
+        .map(|s| format!("\n\n# Active skill\n\n{s}"))
+        .unwrap_or_default();
+
     format!(
-        "{}\n\nCurrent directory: {}\nOS: {}{}",
+        "{}\n\nCurrent directory: {}\nOS: {}{}{}",
         cfg.system_prompt,
         cwd,
         std::env::consts::OS,
         ctx_hint,
+        skill_section,
     )
 }
 

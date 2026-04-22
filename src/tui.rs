@@ -817,7 +817,7 @@ impl App {
         ]);
 
         f.render_widget(
-            Paragraph::new(title_line).style(Style::default().bg(Color::Black)),
+            Paragraph::new(title_line).style(Style::default()),
             area,
         );
     }
