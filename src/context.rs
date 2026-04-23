@@ -28,17 +28,20 @@ pub fn load(system_msg: &Message) -> Vec<Message> {
 
 /// Persist history to disk (skips the system message at index 0).
 pub fn save(messages: &[Message]) {
+    let path = ctx_path();
     if messages.len() <= 1 {
-        let _ = std::fs::remove_file(ctx_path());
+        let _ = std::fs::remove_file(&path);
         return;
     }
-    match serde_json::to_string(&messages[1..]) {
-        Ok(data) => {
-            if let Err(e) = std::fs::write(ctx_path(), &data) {
-                eprintln!("offcode: context save error: {e}");
-            }
-        }
-        Err(e) => eprintln!("offcode: context serialize error: {e}"),
+    let data = match serde_json::to_string(&messages[1..]) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("offcode: context serialize error: {e}"); return; }
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, &data) {
+        eprintln!("offcode: context save error ({}): {e}", path.display());
     }
 }
 

@@ -8,9 +8,18 @@ BINDIR  ?= /usr/local/bin
 
 # ── native build ──────────────────────────────────────────────────────────────
 
+# Ad-hoc codesign on macOS so ring/rustls pages pass kernel validation
+UNAME := $(shell uname)
+ifeq ($(UNAME), Darwin)
+CODESIGN := codesign -s - --force
+else
+CODESIGN := true
+endif
+
 .PHONY: build
 build:
 	cargo build --release
+	$(CODESIGN) target/release/$(NAME)
 	@echo "Binary: target/release/$(NAME)"
 
 .PHONY: run
@@ -52,6 +61,7 @@ aarch64-unknown-linux-musl:
 x86_64-apple-darwin:
 	rustup target add $@ 2>/dev/null || true
 	cargo build --release --target $@
+	codesign -s - --force target/$@/release/$(NAME)
 	$(call copy_binary,$@,macos-x86_64)
 
 # macOS ARM64 (Apple Silicon M1/M2/M3/M4) — must run on macOS host
@@ -59,6 +69,7 @@ x86_64-apple-darwin:
 aarch64-apple-darwin:
 	rustup target add $@ 2>/dev/null || true
 	cargo build --release --target $@
+	codesign -s - --force target/$@/release/$(NAME)
 	$(call copy_binary,$@,macos-arm64)
 
 # Universal macOS binary (Intel + Apple Silicon)

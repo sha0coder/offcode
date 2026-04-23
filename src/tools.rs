@@ -198,6 +198,20 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "change_dir",
+                "description": "Change the current working directory. Use '..' to go up. All subsequent tool calls (read_file, run_command, etc.) will operate from the new directory.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": { "type": "string", "description": "Directory to change to, e.g. 'src', '..', '/tmp', '../other'" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "path_info",
                 "description": "Get metadata about a file or directory (type, size, modified time).",
                 "parameters": {
@@ -456,6 +470,20 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
                     result
                 }
                 Err(e) => format!("Failed to run command: {e}"),
+            }
+        }
+
+        "change_dir" => {
+            let path = sarg(&args, "path");
+            if path.is_empty() { return "Error: 'path' is required".to_string(); }
+            match std::env::set_current_dir(&path) {
+                Ok(_) => {
+                    let cwd = std::env::current_dir()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| path.clone());
+                    format!("Changed directory to: {cwd}")
+                }
+                Err(e) => format!("Error: {e}"),
             }
         }
 
@@ -915,6 +943,7 @@ pub fn print_list() {
         ("create_dir",   "Create directories (mkdir -p)"),
         ("delete_path",     "Delete a file or empty directory"),
         ("path_info",       "File/directory metadata"),
+        ("change_dir",      "Change current working directory (cd)"),
         ("ssh_connect",     "Connect to a remote host via SSH"),
         ("ssh_exec",        "Run a command on the connected SSH host"),
         ("ssh_disconnect",  "Disconnect from the current SSH host"),

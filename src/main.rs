@@ -5,6 +5,8 @@ mod context;
 mod diff;
 mod ollama;
 mod tools;
+mod stt;
+mod tts;
 mod tui;
 mod ui;
 
@@ -86,11 +88,16 @@ fn main() {
     // Single-shot mode (no TUI, just print to stdout)
     if !prompt_words.is_empty() {
         ui::print_mascot(&cfg.model);
-        let mut messages = vec![Message {
+        let system_msg = Message {
             role: "system".to_string(),
             content: build_system_prompt(&cfg),
             tool_calls: None,
-        }];
+        };
+        let mut messages = if cfg.no_ctx {
+            vec![system_msg]
+        } else {
+            context::load(&system_msg)
+        };
         let prompt = prompt_words.join(" ");
         run_turn(&cfg, &client, &mut messages, &prompt);
         if !cfg.no_ctx { context::save(&messages); }
@@ -126,11 +133,20 @@ fn run_repl(cfg: Config, client: Client) {
     );
     println!("{}Type /help, /exit to quit.{}\n", ui::DIM, ui::RESET);
 
-    let mut messages = vec![Message {
+    let system_msg = Message {
         role: "system".to_string(),
         content: build_system_prompt(&cfg),
         tool_calls: None,
-    }];
+    };
+    let mut messages = if cfg.no_ctx {
+        vec![system_msg]
+    } else {
+        context::load(&system_msg)
+    };
+    if messages.len() > 1 {
+        println!("{}Restored {} messages from previous session.{}",
+            ui::DIM, messages.len() - 1, ui::RESET);
+    }
 
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
@@ -422,24 +438,15 @@ pub fn build_system_prompt(cfg: &Config) -> String {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
-    let ctx_hint = if context::ctx_path().exists() {
-        "\n\nA file named .offcode.ctx exists in the current directory. \
-         It contains the conversation history from previous sessions in JSON format. \
-         Read it with the read_file tool at the start to restore context."
-    } else {
-        ""
-    };
-
     let skill_section = tools::active_skill()
         .map(|s| format!("\n\n# Active skill\n\n{s}"))
         .unwrap_or_default();
 
     format!(
-        "{}\n\nCurrent directory: {}\nOS: {}{}{}",
+        "{}\n\nCurrent directory: {}\nOS: {}{}",
         cfg.system_prompt,
         cwd,
         std::env::consts::OS,
-        ctx_hint,
         skill_section,
     )
 }

@@ -15,11 +15,32 @@ pub struct Config {
     pub yolo: bool,
     #[serde(default = "default_auto_approve")]
     pub auto_approve_tools: Vec<String>,
+    #[serde(default = "default_tts")]
+    pub tts: bool,
+    #[serde(default = "default_tts_lang")]
+    pub tts_lang: String,
+    #[serde(default = "default_stt")]
+    pub stt: bool,
+    #[serde(default = "default_stt_cmd")]
+    pub stt_cmd: String,
+    #[serde(default = "default_rec_cmd")]
+    pub rec_cmd: String,
     #[serde(skip)]
     pub no_ctx: bool,
 }
 
 fn default_yolo() -> bool { false }
+fn default_tts() -> bool { false }
+fn default_tts_lang() -> String { "es".to_string() }
+fn default_stt() -> bool { false }
+fn default_stt_cmd() -> String { String::new() }  // user must configure model path
+fn default_rec_cmd() -> String {
+    if cfg!(target_os = "macos") {
+        "sox rec -r 16000 -c 1 -b 16 -e signed-integer".to_string()
+    } else {
+        "arecord -r 16000 -c 1 -f S16_LE".to_string()
+    }
+}
 
 fn default_auto_approve() -> Vec<String> {
     vec!["read_file".into(), "list_dir".into(), "search_files".into(), "path_info".into()]
@@ -48,6 +69,11 @@ impl Default for Config {
             max_tool_iters: 30,
             yolo: false,
             auto_approve_tools: default_auto_approve(),
+            tts: false,
+            tts_lang: default_tts_lang(),
+            stt: false,
+            stt_cmd: default_stt_cmd(),
+            rec_cmd: default_rec_cmd(),
             no_ctx: false,
         }
     }

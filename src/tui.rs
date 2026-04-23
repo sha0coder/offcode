@@ -274,7 +274,7 @@ impl Entry {
 
 const COMMANDS: &[&str] = &[
     "/help", "/clear", "/reset", "/compact", "/tools", "/think", "/yolo",
-    "/model", "/models", "/exit", "/quit",
+    "/model", "/models", "/voice", "/lang", "/exit", "/quit",
 ];
 
 // ── app ───────────────────────────────────────────────────────────────────────
@@ -283,6 +283,8 @@ const COMMANDS: &[&str] = &[
 enum Mode {
     Input,
     Generating,
+    Recording,
+    Transcribing,
 }
 
 struct PendingConfirm {
@@ -302,7 +304,7 @@ pub struct App {
     scroll: u16,
     auto_scroll: bool,
     mode: Mode,
-    queued: Option<String>, // prompt typed while generating, sent when done
+    queued: Option<String>,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<WorkerMsg>,
     _tx: mpsc::Sender<WorkerMsg>,
@@ -310,21 +312,64 @@ pub struct App {
     tick: u64,
     model_names_cache: Option<Vec<String>>,
     pending_confirm: Option<PendingConfirm>,
+    rec_child: Option<std::process::Child>,
+    stt_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    speaker: crate::tts::Speaker,
+    tts_buf: String,
+}
+
+fn entries_from_history(history: &[Message]) -> Vec<Entry> {
+    let mut out = Vec::new();
+    for m in history.iter().skip(1) {
+        match m.role.as_str() {
+            "user" => out.push(Entry::user(m.content.clone())),
+            "assistant" => {
+                if !m.content.trim().is_empty() {
+                    out.push(Entry::assistant(m.content.clone()));
+                }
+                if let Some(calls) = &m.tool_calls {
+                    for c in calls {
+                        out.push(Entry::tool(
+                            c.function.name.clone(),
+                            c.function.arguments.to_string(),
+                        ));
+                    }
+                }
+            }
+            "tool" => {
+                let preview: String = m.content.lines().take(4).collect::<Vec<_>>().join("\n");
+                out.push(Entry::info(preview));
+            }
+            _ => {}
+        }
+    }
+    if !out.is_empty() {
+        out.insert(0, Entry::info(format!(
+            "Restored {} messages from previous session.", history.len() - 1
+        )));
+    }
+    out
 }
 
 impl App {
     pub fn new(cfg: Config, client: Client) -> Self {
         let (tx, rx) = mpsc::channel();
-        let history = vec![Message {
+        let system_msg = Message {
             role: "system".to_string(),
             content: super::build_system_prompt(&cfg),
             tool_calls: None,
-        }];
+        };
+        let history = if cfg.no_ctx {
+            vec![system_msg]
+        } else {
+            crate::context::load(&system_msg)
+        };
+        let entries = entries_from_history(&history);
         Self {
             cfg,
             client,
             history,
-            entries: vec![],
+            entries,
             editor: LineEdit::new(),
             scroll: 0,
             auto_scroll: true,
@@ -337,6 +382,10 @@ impl App {
             cancel: Arc::new(AtomicBool::new(false)),
             model_names_cache: None,
             pending_confirm: None,
+            rec_child: None,
+            stt_rx: None,
+            speaker: crate::tts::Speaker::new(),
+            tts_buf: String::new(),
         }
     }
 
@@ -396,19 +445,39 @@ impl App {
             self.should_quit = true;
             return;
         }
+
+        // Ctrl+R — toggle recording (STT)
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.toggle_recording();
+            return;
+        }
+
+        // Ctrl+S — stop speech
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.speaker.stop();
+            self.tts_buf.clear();
+            return;
+        }
+
         if key.code == KeyCode::Esc {
             if self.pending_confirm.is_some() {
-                // Esc during confirmation → reject with no reason
                 self.deliver_confirm(ConfirmAction::Reject(String::new()));
+                return;
+            }
+            // If TTS is speaking, Esc stops it (second Esc quits)
+            if self.cfg.tts && self.speaker.is_active() {
+                self.speaker.stop();
+                self.tts_buf.clear();
                 return;
             }
             match self.mode {
                 Mode::Generating => {
-                    // Cancel current generation, stay in app
                     self.cancel.store(true, Ordering::Relaxed);
                     self.queued = None;
                 }
                 Mode::Input => self.should_quit = true,
+                Mode::Recording => { self.toggle_recording(); }
+                Mode::Transcribing => {}
             }
             return;
         }
@@ -450,6 +519,11 @@ impl App {
     // ── submission ────────────────────────────────────────────────────────────
 
     fn submit(&mut self) {
+        // Stop any ongoing speech and clear TTS buffer
+        if self.cfg.tts {
+            self.speaker.stop();
+            self.tts_buf.clear();
+        }
         // Confirmation mode intercepts everything except slash commands.
         if self.pending_confirm.is_some() {
             let text = self.editor.take().unwrap_or_default();
@@ -527,6 +601,8 @@ impl App {
                  /model <name>  change model\n\
                  /think  toggle thinking display\n\
                  /yolo  toggle yolo mode (auto-approve tools)\n\
+                 /voice  toggle text-to-speech\n\
+                 /lang <code>  set language for TTS (en, es, fr, de, it, pt)\n\
                  /exit or Ctrl+C  quit".into(),
             )),
             "/clear" | "/reset" => {
@@ -560,6 +636,25 @@ impl App {
                     "off (prompt before each tool call)"
                 };
                 self.entries.push(Entry::info(format!("Yolo mode: {state}")));
+            }
+            "/voice" => {
+                self.cfg.tts = !self.cfg.tts;
+                let state = if self.cfg.tts {
+                    format!("on  ({})", crate::tts::tts_cmd(&self.cfg.tts_lang))
+                } else {
+                    "off".to_string()
+                };
+                self.entries.push(Entry::info(format!("Voice: {state}")));
+            }
+            s if s.starts_with("/lang ") => {
+                let lang = s[6..].trim().to_string();
+                self.cfg.tts_lang = lang.clone();
+                let cmd = crate::tts::tts_cmd(&lang);
+                self.entries.push(Entry::info(format!("Language → {lang}  (voice: {cmd})")));
+            }
+            "/lang" => {
+                self.entries.push(Entry::info(format!("Current language: {}  (voice: {})",
+                    self.cfg.tts_lang, crate::tts::tts_cmd(&self.cfg.tts_lang))));
             }
             "/exit" | "/quit" => self.should_quit = true,
             "/model" | "/models" => self.list_models_entry(),
@@ -662,6 +757,47 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             self.handle_worker_msg(msg);
         }
+        // Poll STT transcription result
+        if let Some(ref rx) = self.stt_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.stt_rx = None;
+                self.mode = Mode::Input;
+                match result {
+                    Ok(text) => {
+                        self.editor.set(text);
+                        self.entries.push(Entry::info("Transcription ready — press Enter to send or edit first.".into()));
+                    }
+                    Err(e) => self.entries.push(Entry::error(e)),
+                }
+            }
+        }
+    }
+
+    fn toggle_recording(&mut self) {
+        match self.mode {
+            Mode::Recording => {
+                // Stop recording and start transcription
+                if let Some(child) = self.rec_child.take() {
+                    self.mode = Mode::Transcribing;
+                    self.entries.push(Entry::info("Transcribing…".into()));
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.stt_rx = Some(rx);
+                    crate::stt::transcribe_async(child, self.cfg.stt_cmd.clone(), tx);
+                }
+            }
+            Mode::Input => {
+                match crate::stt::start_recording(&self.cfg.rec_cmd) {
+                    Ok(child) => {
+                        self.rec_child = Some(child);
+                        self.mode = Mode::Recording;
+                        self.entries.push(Entry::info("Recording… press Ctrl+R or Esc to stop.".into()));
+                        self.auto_scroll = true;
+                    }
+                    Err(e) => self.entries.push(Entry::error(e)),
+                }
+            }
+            _ => {}
+        }
     }
 
     fn handle_worker_msg(&mut self, msg: WorkerMsg) {
@@ -678,9 +814,17 @@ impl App {
             WorkerMsg::Token(t) => {
                 match self.entries.last_mut() {
                     Some(e) if e.role == Role::Assistant => e.text.push_str(&t),
-                    _ => self.entries.push(Entry::assistant(t)),
+                    _ => self.entries.push(Entry::assistant(t.clone())),
                 }
                 self.auto_scroll = true;
+                // Stream TTS sentence by sentence
+                if self.cfg.tts {
+                    self.tts_buf.push_str(&t);
+                    for sentence in crate::tts::drain_sentences(&mut self.tts_buf) {
+                        let clean = crate::tts::clean_for_speech(&sentence);
+                        self.speaker.say(&clean, &self.cfg.tts_lang);
+                    }
+                }
             }
             WorkerMsg::ToolBegin { name, args } => {
                 let arg_str = fmt_args(&args);
@@ -743,6 +887,12 @@ impl App {
             }
             WorkerMsg::Done => {
                 if !self.cfg.no_ctx { crate::context::save(&self.history); }
+                // Flush any remaining tail (sentence without ending punctuation)
+                if self.cfg.tts && !self.tts_buf.is_empty() {
+                    let tail = crate::tts::clean_for_speech(&self.tts_buf.clone());
+                    self.speaker.say(&tail, &self.cfg.tts_lang);
+                    self.tts_buf.clear();
+                }
                 self.mode = Mode::Input;
                 if let Some(queued) = self.queued.take() {
                     self.editor.set(queued);
@@ -751,9 +901,8 @@ impl App {
             }
             WorkerMsg::Error(e) => {
                 self.mode = Mode::Input;
-                self.queued = None; // drop queued on error
+                self.queued = None;
                 self.entries.push(Entry::error(e));
-                // Remove user message that caused error
                 if let Some(last) = self.history.last() {
                     if last.role == "user" {
                         self.history.pop();
@@ -792,14 +941,17 @@ impl App {
 
     fn render_title(&self, f: &mut Frame, area: ratatui::layout::Rect) {
         const SPINNER: &[&str] = &["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"];
-        let generating_indicator = if self.mode == Mode::Generating {
-            let frame = (self.tick / 3) as usize % SPINNER.len();
-            Span::styled(
-                format!(" {} thinking…", SPINNER[frame]),
-                Style::default().fg(Color::Yellow),
-            )
-        } else {
-            Span::raw("")
+        let generating_indicator = match self.mode {
+            Mode::Generating => {
+                let frame = (self.tick / 3) as usize % SPINNER.len();
+                Span::styled(format!(" {} thinking…", SPINNER[frame]), Style::default().fg(Color::Yellow))
+            }
+            Mode::Recording => {
+                let dot = if (self.tick / 6) % 2 == 0 { "●" } else { "○" };
+                Span::styled(format!(" {dot} recording…"), Style::default().fg(Color::Red))
+            }
+            Mode::Transcribing => Span::styled(" ◌ transcribing…", Style::default().fg(Color::Magenta)),
+            Mode::Input => Span::raw(""),
         };
 
         let title_line = Line::from(vec![
