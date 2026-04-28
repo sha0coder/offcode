@@ -60,6 +60,91 @@ struct R2Session {
 
 static R2: Mutex<Option<R2Session>> = Mutex::new(None);
 
+// ── IRC session ───────────────────────────────────────────────────────────────
+
+enum IrcStream {
+    Plain(std::net::TcpStream),
+    Tls(Box<native_tls::TlsStream<std::net::TcpStream>>),
+}
+
+impl IrcStream {
+    fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> std::io::Result<()> {
+        match self {
+            IrcStream::Plain(s) => s.set_read_timeout(dur),
+            IrcStream::Tls(s)   => s.get_ref().set_read_timeout(dur),
+        }
+    }
+}
+
+impl std::io::Read for IrcStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            IrcStream::Plain(s) => s.read(buf),
+            IrcStream::Tls(s)   => s.read(buf),
+        }
+    }
+}
+
+impl std::io::Write for IrcStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            IrcStream::Plain(s) => s.write(buf),
+            IrcStream::Tls(s)   => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            IrcStream::Plain(s) => s.flush(),
+            IrcStream::Tls(s)   => s.flush(),
+        }
+    }
+}
+
+struct IrcSession {
+    reader:  BufReader<IrcStream>,
+    channel: String,
+    nick:    String,
+    host:    String,
+}
+
+static IRC: Mutex<Option<IrcSession>> = Mutex::new(None);
+
+fn irc_send_line(stream: &mut IrcStream, line: &str) -> std::io::Result<()> {
+    stream.write_all(line.as_bytes())?;
+    stream.write_all(b"\r\n")?;
+    stream.flush()
+}
+
+// Drain any available lines without blocking. Auto-responds to PING.
+// `budget_ms` is the total time we're willing to wait for output.
+fn irc_drain(session: &mut IrcSession, budget_ms: u64) -> String {
+    use std::io::ErrorKind;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+    let _ = session.reader.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(200)));
+    let mut out = String::new();
+    loop {
+        let mut line = String::new();
+        match session.reader.read_line(&mut line) {
+            Ok(0) => { out.push_str("[irc: connection closed]\n"); break; }
+            Ok(_) => {
+                let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+                if let Some(rest) = trimmed.strip_prefix("PING ") {
+                    let pong = format!("PONG {rest}");
+                    let _ = irc_send_line(session.reader.get_mut(), &pong);
+                    continue;
+                }
+                out.push_str(&trimmed);
+                out.push('\n');
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                if std::time::Instant::now() >= deadline { break; }
+            }
+            Err(e) => { out.push_str(&format!("[read error: {e}]\n")); break; }
+        }
+    }
+    out
+}
+
 // ── browser state ────────────────────────────────────────────────────────────
 
 struct FormField {
@@ -294,6 +379,76 @@ pub fn definitions() -> Vec<Value> {
                     "required": [],
                     "properties": {}
                 }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "irc_open",
+                "description": "Connect to an IRC server over TLS (default port 6697) and join a channel. Persists for the session; use irc_say / irc_read / irc_close.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["host", "nick", "channel"],
+                    "properties": {
+                        "host":     { "type": "string", "description": "IRC server hostname, e.g. irc.libera.chat" },
+                        "port":     { "type": "integer", "description": "TCP port (default 6697 with SSL, 6667 without)" },
+                        "nick":     { "type": "string", "description": "Nickname to register with" },
+                        "channel":  { "type": "string", "description": "Channel to join, e.g. #rust (will prepend '#' if missing)" },
+                        "ssl":      { "type": "boolean", "description": "Use TLS (default true)" },
+                        "password": { "type": "string", "description": "Optional server password (sent via PASS before NICK)" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "irc_say",
+                "description": "Send a PRIVMSG to the joined channel (or to 'target' if given — a user or another channel).",
+                "parameters": {
+                    "type": "object",
+                    "required": ["message"],
+                    "properties": {
+                        "message": { "type": "string", "description": "Message text" },
+                        "target":  { "type": "string", "description": "Optional target (user or channel). Defaults to the joined channel." }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "irc_read",
+                "description": "Read pending lines from the IRC server (auto-responds to PING). Blocks up to timeout_ms collecting whatever arrives.",
+                "parameters": {
+                    "type": "object",
+                    "required": [],
+                    "properties": {
+                        "timeout_ms": { "type": "integer", "description": "Total time budget to wait for output, in ms (default 3000)" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "irc_raw",
+                "description": "Send a raw IRC command line (without CRLF), e.g. 'JOIN #rust' or 'WHOIS alice'.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": { "type": "string", "description": "Raw IRC command" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "irc_close",
+                "description": "Disconnect from the IRC server (sends QUIT).",
+                "parameters": { "type": "object", "required": [], "properties": {} }
             }
         }),
         json!({
@@ -788,6 +943,185 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
             }
         }
 
+        "irc_open" => {
+            let host     = sarg(&args, "host");
+            let nick     = sarg(&args, "nick");
+            let mut chan = sarg(&args, "channel");
+            let password = sarg(&args, "password");
+            let ssl      = args.get("ssl").and_then(|v| v.as_bool()).unwrap_or(true);
+            let port     = args.get("port").and_then(|v| v.as_u64())
+                .unwrap_or(if ssl { 6697 } else { 6667 }) as u16;
+
+            if host.is_empty() { return "Error: 'host' is required".to_string(); }
+            if nick.is_empty() { return "Error: 'nick' is required".to_string(); }
+            if chan.is_empty() { return "Error: 'channel' is required".to_string(); }
+            if !chan.starts_with('#') && !chan.starts_with('&') { chan = format!("#{chan}"); }
+
+            // Close any existing session first
+            if let Ok(mut g) = IRC.lock() {
+                if let Some(mut old) = g.take() {
+                    let _ = irc_send_line(old.reader.get_mut(), "QUIT :bye");
+                }
+            }
+
+            let tcp = match std::net::TcpStream::connect((host.as_str(), port)) {
+                Ok(s) => s,
+                Err(e) => return format!("Connect failed: {e}"),
+            };
+            if let Err(e) = tcp.set_read_timeout(Some(std::time::Duration::from_secs(10))) {
+                return format!("socket setup error: {e}");
+            }
+
+            let mut stream = if ssl {
+                let connector = match native_tls::TlsConnector::new() {
+                    Ok(c) => c,
+                    Err(e) => return format!("TLS init: {e}"),
+                };
+                match connector.connect(&host, tcp) {
+                    Ok(s)  => IrcStream::Tls(Box::new(s)),
+                    Err(e) => return format!("TLS handshake: {e}"),
+                }
+            } else {
+                IrcStream::Plain(tcp)
+            };
+
+            if !password.is_empty() {
+                if let Err(e) = irc_send_line(&mut stream, &format!("PASS {password}")) {
+                    return format!("PASS write error: {e}");
+                }
+            }
+            if let Err(e) = irc_send_line(&mut stream, &format!("NICK {nick}")) {
+                return format!("NICK write error: {e}");
+            }
+            if let Err(e) = irc_send_line(&mut stream, &format!("USER {nick} 0 * :{nick}")) {
+                return format!("USER write error: {e}");
+            }
+            if let Err(e) = irc_send_line(&mut stream, &format!("JOIN {chan}")) {
+                return format!("JOIN write error: {e}");
+            }
+
+            let mut session = IrcSession {
+                reader: BufReader::new(stream),
+                channel: chan.clone(),
+                nick: nick.clone(),
+                host: host.clone(),
+            };
+
+            // Collect welcome + MOTD + join confirmation, up to ~8s or until 366 arrives
+            use std::io::ErrorKind;
+            let _ = session.reader.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(500)));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let mut welcome = String::new();
+            let mut joined  = false;
+            let mut fatal: Option<String> = None;
+            while std::time::Instant::now() < deadline {
+                let mut line = String::new();
+                match session.reader.read_line(&mut line) {
+                    Ok(0) => { fatal = Some("connection closed during handshake".into()); break; }
+                    Ok(_) => {
+                        let l = line.trim_end_matches(['\r', '\n']).to_string();
+                        if let Some(rest) = l.strip_prefix("PING ") {
+                            let _ = irc_send_line(session.reader.get_mut(), &format!("PONG {rest}"));
+                            continue;
+                        }
+                        welcome.push_str(&l);
+                        welcome.push('\n');
+                        // 366 = End of /NAMES list → joined successfully
+                        if l.contains(" 366 ") && l.contains(&chan) { joined = true; break; }
+                        // Error replies: nick in use / banned
+                        if l.contains(" 433 ") || l.contains(" 432 ") || l.contains(" 465 ") || l.contains(" 474 ") {
+                            fatal = Some(l);
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => continue,
+                    Err(e) => { fatal = Some(format!("read error: {e}")); break; }
+                }
+            }
+
+            if let Some(err) = fatal {
+                return format!("IRC connect failed: {err}\n--- partial log ---\n{welcome}");
+            }
+
+            if let Ok(mut g) = IRC.lock() { *g = Some(session); }
+            let status = if joined { "joined" } else { "connected (no 366 seen yet)" };
+            format!(
+                "IRC {status} to {host}:{port} as {nick} in {chan}. \
+                 Use irc_say to talk, irc_read to poll messages, irc_close to disconnect.\n\
+                 --- server greeting ---\n{welcome}"
+            )
+        }
+
+        "irc_say" => {
+            let message = sarg(&args, "message");
+            let target  = sarg(&args, "target");
+            if message.is_empty() { return "Error: 'message' is required".to_string(); }
+            match IRC.lock() {
+                Ok(mut g) => match g.as_mut() {
+                    None => "No IRC session open. Use irc_open first.".to_string(),
+                    Some(session) => {
+                        let dest = if target.is_empty() { session.channel.clone() } else { target };
+                        // Split multi-line messages into separate PRIVMSGs
+                        let mut sent = 0;
+                        for line in message.lines() {
+                            if line.is_empty() { continue; }
+                            let payload = format!("PRIVMSG {dest} :{line}");
+                            if let Err(e) = irc_send_line(session.reader.get_mut(), &payload) {
+                                return format!("write error after {sent} line(s): {e}");
+                            }
+                            sent += 1;
+                        }
+                        format!("Sent {sent} line(s) to {dest}.")
+                    }
+                },
+                Err(_) => "irc lock error".to_string(),
+            }
+        }
+
+        "irc_read" => {
+            let budget = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(3000);
+            match IRC.lock() {
+                Ok(mut g) => match g.as_mut() {
+                    None => "No IRC session open. Use irc_open first.".to_string(),
+                    Some(session) => {
+                        let out = irc_drain(session, budget);
+                        if out.is_empty() { "(no new messages)".to_string() } else { out }
+                    }
+                },
+                Err(_) => "irc lock error".to_string(),
+            }
+        }
+
+        "irc_raw" => {
+            let command = sarg(&args, "command");
+            if command.is_empty() { return "Error: 'command' is required".to_string(); }
+            match IRC.lock() {
+                Ok(mut g) => match g.as_mut() {
+                    None => "No IRC session open. Use irc_open first.".to_string(),
+                    Some(session) => {
+                        if let Err(e) = irc_send_line(session.reader.get_mut(), &command) {
+                            return format!("write error: {e}");
+                        }
+                        format!("Sent: {command}")
+                    }
+                },
+                Err(_) => "irc lock error".to_string(),
+            }
+        }
+
+        "irc_close" => {
+            match IRC.lock() {
+                Ok(mut g) => match g.take() {
+                    None => "No IRC session open.".to_string(),
+                    Some(mut session) => {
+                        let _ = irc_send_line(session.reader.get_mut(), "QUIT :bye");
+                        format!("IRC session closed ({}@{}).", session.nick, session.host)
+                    }
+                },
+                Err(_) => "irc lock error".to_string(),
+            }
+        }
+
         "browser_navigate" => {
             let url = sarg(&args, "url");
             if url.is_empty() { return "Error: 'url' is required".to_string(); }
@@ -932,6 +1266,39 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
     }
 }
 
+/// Close any open SSH / radare2 / IRC sessions. Safe to call multiple times.
+/// Returns a list of human-readable lines describing what was closed (empty if nothing).
+pub fn cleanup_all() -> Vec<String> {
+    let mut closed = Vec::new();
+
+    if let Ok(mut g) = IRC.lock() {
+        if let Some(mut s) = g.take() {
+            let _ = irc_send_line(s.reader.get_mut(), "QUIT :offcode exiting");
+            closed.push(format!("IRC: closed {}@{}", s.nick, s.host));
+        }
+    }
+
+    if let Ok(mut g) = R2.lock() {
+        if let Some(mut s) = g.take() {
+            let _ = s.stdin.write_all(b"q\n");
+            let _ = s.child.wait();
+            closed.push("r2: session closed".into());
+        }
+    }
+
+    if let Ok(mut g) = SSH.lock() {
+        if let Some(s) = g.take() {
+            let _ = Command::new("ssh")
+                .args(["-S", &s.socket, "-O", "exit",
+                       &format!("{}@{}", s.user, s.host)])
+                .output();
+            closed.push(format!("SSH: disconnected from {}@{}", s.user, s.host));
+        }
+    }
+
+    closed
+}
+
 pub fn print_list() {
     use crate::ui::*;
     let tools = [
@@ -950,6 +1317,11 @@ pub fn print_list() {
         ("r2_open",          "Open a radare2 session on a binary (-w write, -n no-analysis)"),
         ("r2_cmd",           "Send command(s) to the open r2 session"),
         ("r2_close",         "Close the current r2 session"),
+        ("irc_open",         "Connect to IRC (TLS by default) and join a channel"),
+        ("irc_say",          "Send a PRIVMSG to the joined channel (or another target)"),
+        ("irc_read",         "Poll incoming IRC lines (auto-responds to PING)"),
+        ("irc_raw",          "Send a raw IRC command"),
+        ("irc_close",        "Disconnect from IRC"),
         ("browser_navigate", "Navigate to a URL, get page text + forms"),
         ("browser_fill",    "Fill a form field on the current page"),
         ("browser_submit",  "Submit the current form (GET or POST)"),
@@ -1127,7 +1499,7 @@ fn resolve_url(base: &str, href: &str) -> String {
         return format!("{scheme}:{href}");
     }
     // Extract origin from base
-    if let Some(after_scheme) = base.splitn(2, "://").nth(1) {
+    if let Some((_, after_scheme)) = base.split_once("://") {
         let origin_end = after_scheme.find('/').map(|i| i + base.find("://").unwrap_or(0) + 3).unwrap_or(base.len());
         let origin = &base[..origin_end];
         if href.starts_with('/') {

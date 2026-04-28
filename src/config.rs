@@ -27,6 +27,8 @@ pub struct Config {
     pub rec_cmd: String,
     #[serde(skip)]
     pub no_ctx: bool,
+    #[serde(skip)]
+    pub system_append: String,
 }
 
 fn default_yolo() -> bool { false }
@@ -75,6 +77,7 @@ impl Default for Config {
             stt_cmd: default_stt_cmd(),
             rec_cmd: default_rec_cmd(),
             no_ctx: false,
+            system_append: String::new(),
         }
     }
 }

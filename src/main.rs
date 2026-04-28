@@ -60,6 +60,27 @@ fn main() {
             "--think" => cfg.show_thinking = true,
             "--no-tui" => no_tui = true,
             "--no-ctx" => cfg.no_ctx = true,
+            "-s" | "--system" => {
+                i += 1;
+                if let Some(t) = raw_args.get(i) {
+                    append_to_system(&mut cfg.system_append, t);
+                }
+            }
+            "--system-file" => {
+                i += 1;
+                if let Some(p) = raw_args.get(i) {
+                    match std::fs::read_to_string(p) {
+                        Ok(s) => append_to_system(&mut cfg.system_append, s.trim_end()),
+                        Err(e) => {
+                            eprintln!(
+                                "{}{}Error:{} cannot read --system-file {}: {e}",
+                                ui::BOLD, ui::RED, ui::RESET, p
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
             _ => {
                 prompt_words = raw_args[i..].to_vec();
                 break;
@@ -101,6 +122,9 @@ fn main() {
         let prompt = prompt_words.join(" ");
         run_turn(&cfg, &client, &mut messages, &prompt);
         if !cfg.no_ctx { context::save(&messages); }
+        for line in tools::cleanup_all() {
+            eprintln!("{}{}{}", ui::DIM, line, ui::RESET);
+        }
         return;
     }
 
@@ -160,6 +184,9 @@ fn run_repl(cfg: Config, client: Client) {
         match stdin.read_line(&mut line) {
             Ok(0) | Err(_) => {
                 println!();
+                for line in tools::cleanup_all() {
+                    eprintln!("{}{}{}", ui::DIM, line, ui::RESET);
+                }
                 break;
             }
             Ok(_) => {}
@@ -172,6 +199,9 @@ fn run_repl(cfg: Config, client: Client) {
 
         match input.as_str() {
             "/exit" | "/quit" | "/q" => {
+                for line in tools::cleanup_all() {
+                    println!("{}{}{}", ui::DIM, line, ui::RESET);
+                }
                 println!("{}Goodbye!{}", ui::CYAN, ui::RESET);
                 break;
             }
@@ -195,6 +225,49 @@ fn run_repl(cfg: Config, client: Client) {
             s if s.starts_with("/model ") => {
                 cfg.model = s[7..].trim().to_string();
                 println!("{}Model → {}{}", ui::DIM, cfg.model, ui::RESET);
+            }
+            "/system" => {
+                if cfg.system_append.is_empty() {
+                    println!("{}(no system prompt addendum){}", ui::DIM, ui::RESET);
+                } else {
+                    println!("{}{}{}", ui::DIM, cfg.system_append, ui::RESET);
+                }
+            }
+            "/system clear" | "/system reset" => {
+                cfg.system_append.clear();
+                if let Some(sys) = messages.first_mut() {
+                    sys.content = build_system_prompt(&cfg);
+                }
+                println!("{}System prompt addendum cleared.{}", ui::DIM, ui::RESET);
+            }
+            s if s.starts_with("/system load ") => {
+                let path = strip_quotes(s[12..].trim());
+                if path.is_empty() {
+                    println!("{}(file path required){}", ui::YELLOW, ui::RESET);
+                } else {
+                    match std::fs::read_to_string(path) {
+                        Ok(text) => {
+                            append_to_system(&mut cfg.system_append, text.trim_end());
+                            if let Some(sys) = messages.first_mut() {
+                                sys.content = build_system_prompt(&cfg);
+                            }
+                            println!("{}Appended {} to system prompt.{}", ui::DIM, path, ui::RESET);
+                        }
+                        Err(e) => println!("{}cannot read {path}: {e}{}", ui::YELLOW, ui::RESET),
+                    }
+                }
+            }
+            s if s.starts_with("/system ") => {
+                let extra = strip_quotes(s[8..].trim());
+                if extra.is_empty() {
+                    println!("{}(empty text ignored){}", ui::DIM, ui::RESET);
+                } else {
+                    append_to_system(&mut cfg.system_append, extra);
+                    if let Some(sys) = messages.first_mut() {
+                        sys.content = build_system_prompt(&cfg);
+                    }
+                    println!("{}Appended to system prompt.{}", ui::DIM, ui::RESET);
+                }
             }
             s if s.starts_with('/') => {
                 println!("{}Unknown command. /help{}", ui::DIM, ui::RESET);
@@ -442,16 +515,44 @@ pub fn build_system_prompt(cfg: &Config) -> String {
         .map(|s| format!("\n\n# Active skill\n\n{s}"))
         .unwrap_or_default();
 
+    let append_section = if cfg.system_append.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", cfg.system_append)
+    };
+
     format!(
-        "{}\n\nCurrent directory: {}\nOS: {}{}",
+        "{}\n\nCurrent directory: {}\nOS: {}{}{}",
         cfg.system_prompt,
         cwd,
         std::env::consts::OS,
         skill_section,
+        append_section,
     )
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+pub fn append_to_system(buf: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if !buf.is_empty() {
+        buf.push('\n');
+    }
+    buf.push_str(text);
+}
+
+pub fn strip_quotes(s: &str) -> &str {
+    let s = s.trim();
+    if (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
+        || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
 
 fn print_help() {
     let b = ui::BOLD;
@@ -471,6 +572,8 @@ fn print_help() {
     println!("  {c}    --url <URL>{r}       {d}Ollama base URL{r}");
     println!("  {c}    --think{r}           {d}Show thinking tokens{r}");
     println!("  {c}    --no-tui{r}          {d}Plain terminal mode (no TUI){r}");
+    println!("  {c}-s, --system <TEXT>{r}   {d}Append TEXT to the system prompt (repeatable){r}");
+    println!("  {c}    --system-file <P>{r} {d}Append contents of file P to the system prompt{r}");
     println!("  {c}    --config{r}          {d}Print configuration{r}");
     println!("  {c}-v, --version{r}         {d}Print version{r}");
     println!("  {c}-h, --help{r}            {d}Print help{r}");
@@ -491,6 +594,10 @@ fn print_repl_help() {
     println!("  {c}/model <name>{r}   {d}Switch model{r}");
     println!("  {c}/config{r}         {d}Show config{r}");
     println!("  {c}/yolo{r}           {d}Toggle yolo mode (auto-approve tool calls){r}");
+    println!("  {c}/system{r}         {d}Show system prompt addendum{r}");
+    println!("  {c}/system <text>{r}  {d}Append <text> to the system prompt{r}");
+    println!("  {c}/system load <path>{r} {d}Append file contents to the system prompt{r}");
+    println!("  {c}/system clear{r}   {d}Remove the system prompt addendum{r}");
     println!("  {c}/exit{r}           {d}Quit{r}");
 }
 

@@ -274,7 +274,7 @@ impl Entry {
 
 const COMMANDS: &[&str] = &[
     "/help", "/clear", "/reset", "/compact", "/tools", "/think", "/yolo",
-    "/model", "/models", "/voice", "/lang", "/exit", "/quit",
+    "/model", "/models", "/voice", "/lang", "/system", "/exit", "/quit",
 ];
 
 // ── app ───────────────────────────────────────────────────────────────────────
@@ -603,6 +603,10 @@ impl App {
                  /yolo  toggle yolo mode (auto-approve tools)\n\
                  /voice  toggle text-to-speech\n\
                  /lang <code>  set language for TTS (en, es, fr, de, it, pt)\n\
+                 /system  show system prompt addendum\n\
+                 /system <text>  append <text> to the system prompt\n\
+                 /system load <path>  append file contents to the system prompt\n\
+                 /system clear  remove the system prompt addendum\n\
                  /exit or Ctrl+C  quit".into(),
             )),
             "/clear" | "/reset" => {
@@ -662,6 +666,53 @@ impl App {
                 let model = s[7..].trim().to_string();
                 self.cfg.model = model.clone();
                 self.entries.push(Entry::info(format!("Model → {model}")));
+            }
+            "/system" => {
+                if self.cfg.system_append.is_empty() {
+                    self.entries.push(Entry::info("(no system prompt addendum)".into()));
+                } else {
+                    self.entries.push(Entry::info(self.cfg.system_append.clone()));
+                }
+            }
+            "/system clear" | "/system reset" => {
+                self.cfg.system_append.clear();
+                if let Some(sys) = self.history.first_mut() {
+                    sys.content = crate::build_system_prompt(&self.cfg);
+                }
+                self.entries.push(Entry::info("System prompt addendum cleared.".into()));
+            }
+            s if s.starts_with("/system load ") => {
+                let path = crate::strip_quotes(s[12..].trim());
+                if path.is_empty() {
+                    self.entries.push(Entry::info("(file path required)".into()));
+                } else {
+                    match std::fs::read_to_string(path) {
+                        Ok(text) => {
+                            crate::append_to_system(&mut self.cfg.system_append, text.trim_end());
+                            if let Some(sys) = self.history.first_mut() {
+                                sys.content = crate::build_system_prompt(&self.cfg);
+                            }
+                            self.entries.push(Entry::info(format!(
+                                "Appended {path} to system prompt."
+                            )));
+                        }
+                        Err(e) => self
+                            .entries
+                            .push(Entry::error(format!("cannot read {path}: {e}"))),
+                    }
+                }
+            }
+            s if s.starts_with("/system ") => {
+                let extra = crate::strip_quotes(s[8..].trim());
+                if extra.is_empty() {
+                    self.entries.push(Entry::info("(empty text ignored)".into()));
+                } else {
+                    crate::append_to_system(&mut self.cfg.system_append, extra);
+                    if let Some(sys) = self.history.first_mut() {
+                        sys.content = crate::build_system_prompt(&self.cfg);
+                    }
+                    self.entries.push(Entry::info("Appended to system prompt.".into()));
+                }
             }
             _ => self.entries.push(Entry::error("Unknown command. /help for list.".to_string())),
         }
@@ -947,7 +998,7 @@ impl App {
                 Span::styled(format!(" {} thinking…", SPINNER[frame]), Style::default().fg(Color::Yellow))
             }
             Mode::Recording => {
-                let dot = if (self.tick / 6) % 2 == 0 { "●" } else { "○" };
+                let dot = if (self.tick / 6).is_multiple_of(2) { "●" } else { "○" };
                 Span::styled(format!(" {dot} recording…"), Style::default().fg(Color::Red))
             }
             Mode::Transcribing => Span::styled(" ◌ transcribing…", Style::default().fg(Color::Magenta)),
@@ -1422,9 +1473,10 @@ fn run_compact_worker(
 // ── public entry point ────────────────────────────────────────────────────────
 
 pub fn run(cfg: Config, client: Client) -> std::io::Result<()> {
-    // Set up panic handler to restore terminal
+    // Set up panic handler to restore terminal and close sessions
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = crate::tools::cleanup_all();
         ratatui::restore();
         original_hook(info);
     }));
@@ -1461,8 +1513,12 @@ pub fn run(cfg: Config, client: Client) -> std::io::Result<()> {
         }
     }
 
+    let closed = crate::tools::cleanup_all();
     execute!(std::io::stdout(), DisableBracketedPaste)?;
     ratatui::restore();
+    for line in &closed {
+        eprintln!("{line}");
+    }
     Ok(())
 }
 
