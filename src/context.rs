@@ -1,13 +1,29 @@
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::ollama::Message;
 
 pub fn ctx_path() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".offcode.ctx")
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let key = sanitize_path(&cwd);
+
+    let dir = dirs::data_dir()
+        .map(|d| d.join("offcode"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".offcode")))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    dir.join("contexts").join(format!("{key}.ctx"))
+}
+
+fn sanitize_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '_',
+            _ => c,
+        })
+        .collect()
 }
 
 /// Load persisted history and prepend the system message.
