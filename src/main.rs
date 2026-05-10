@@ -58,6 +58,7 @@ fn main() {
                 }
             }
             "--think" => cfg.show_thinking = true,
+            "--no-think" | "--nothink" => cfg.think = false,
             "--no-tui" => no_tui = true,
             "--no-ctx" => cfg.no_ctx = true,
             "-s" | "--system" => {
@@ -308,6 +309,7 @@ fn run_turn(cfg: &Config, client: &Client, messages: &mut Vec<Message>, input: &
                 temperature: cfg.temperature,
                 num_ctx: cfg.num_ctx,
             },
+            think: if cfg.think { None } else { Some(false) },
         };
 
         let mut first_token = true;
@@ -452,6 +454,7 @@ fn run_compact(cfg: &Config, client: &Client, messages: &mut Vec<Message>) {
             temperature: cfg.temperature,
             num_ctx: cfg.num_ctx,
         },
+        think: if cfg.think { None } else { Some(false) },
     };
     print!("{}", ui::DIM);
     io::stdout().flush().ok();

@@ -273,7 +273,7 @@ impl Entry {
 // ── slash commands (used by /help and Tab completion) ────────────────────────
 
 const COMMANDS: &[&str] = &[
-    "/help", "/clear", "/reset", "/compact", "/tools", "/think", "/yolo",
+    "/help", "/clear", "/reset", "/compact", "/tools", "/think", "/nothink", "/yolo",
     "/model", "/models", "/voice", "/lang", "/system", "/exit", "/quit",
 ];
 
@@ -600,6 +600,7 @@ impl App {
                  /model  list available models\n\
                  /model <name>  change model\n\
                  /think  toggle thinking display\n\
+                 /nothink  toggle native thinking on/off (disables model reasoning when off)\n\
                  /yolo  toggle yolo mode (auto-approve tools)\n\
                  /voice  toggle text-to-speech\n\
                  /lang <code>  set language for TTS (en, es, fr, de, it, pt)\n\
@@ -631,6 +632,15 @@ impl App {
                 self.cfg.show_thinking = !self.cfg.show_thinking;
                 let state = if self.cfg.show_thinking { "on" } else { "off" };
                 self.entries.push(Entry::info(format!("Thinking display: {state}")));
+            }
+            "/nothink" => {
+                self.cfg.think = !self.cfg.think;
+                let state = if self.cfg.think {
+                    "on (model thinks; Ollama default)"
+                } else {
+                    "off (think:false sent to Ollama)"
+                };
+                self.entries.push(Entry::info(format!("Native thinking: {state}")));
             }
             "/yolo" => {
                 self.cfg.yolo = !self.cfg.yolo;
@@ -1287,6 +1297,7 @@ fn run_worker(
                 temperature: cfg.temperature,
                 num_ctx: cfg.num_ctx,
             },
+            think: if cfg.think { None } else { Some(false) },
         };
 
         let tx2 = tx.clone();
@@ -1445,6 +1456,7 @@ fn run_compact_worker(
             temperature: cfg.temperature,
             num_ctx: cfg.num_ctx,
         },
+        think: if cfg.think { None } else { Some(false) },
     };
 
     let tx2 = tx.clone();

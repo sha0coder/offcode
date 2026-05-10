@@ -1,8 +1,10 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
+
+use r2pipe::{R2Pipe, R2PipeSpawnOptions};
 
 // ── SSH session state ─────────────────────────────────────────────────────────
 
@@ -52,13 +54,14 @@ You are an expert reverse engineer using radare2. Follow these guidelines:
 
 // ── radare2 session ───────────────────────────────────────────────────────────
 
-struct R2Session {
-    child:  Child,
-    stdin:  ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
-}
+// R2Pipe wraps a `Box<dyn Pipe>`. The trait isn't declared `Send`, but every
+// concrete pipe variant we use (R2PipeSpawn) holds only Send members
+// (BufReader<ChildStdout>, ChildStdin, Child). Wrap in a newtype so we can
+// keep it in a `static Mutex` shared across the worker thread.
+struct R2Cell(R2Pipe);
+unsafe impl Send for R2Cell {}
 
-static R2: Mutex<Option<R2Session>> = Mutex::new(None);
+static R2: Mutex<Option<R2Cell>> = Mutex::new(None);
 
 // ── IRC session ───────────────────────────────────────────────────────────────
 
@@ -855,35 +858,24 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
 
             // Close any existing session first
             if let Ok(mut g) = R2.lock() {
-                if let Some(mut old) = g.take() {
-                    let _ = old.stdin.write_all(b"q\n");
-                    let _ = old.child.wait();
-                }
+                if let Some(mut old) = g.take() { old.0.close(); }
             }
 
-            let mut cmd = Command::new("r2");
-            if write       { cmd.arg("-w"); }
-            if no_analysis { cmd.arg("-n"); }
-            cmd.arg("-q0").arg(&file)   // -q0: quiet + no banner, still interactive
-               .stdin(Stdio::piped())
-               .stdout(Stdio::piped())
-               .stderr(Stdio::null());
+            let mut extra: Vec<&'static str> = Vec::new();
+            if write       { extra.push("-w"); }
+            if no_analysis { extra.push("-n"); }
+            let opts = R2PipeSpawnOptions { exepath: "r2".to_string(), args: extra };
 
-            match cmd.spawn() {
+            match R2Pipe::spawn(&file, Some(opts)) {
                 Err(e) => format!("Failed to launch r2: {e}"),
-                Ok(mut child) => {
-                    let stdin  = child.stdin.take().unwrap();
-                    let stdout = BufReader::new(child.stdout.take().unwrap());
-                    let mut session = R2Session { child, stdin, stdout };
-                    // Drain the initial prompt/banner
-                    r2_drain(&mut session.stdout);
+                Ok(pipe) => {
                     let mode = match (write, no_analysis) {
                         (true, true)  => " [-w -n]",
                         (true, false) => " [-w]",
                         (false, true) => " [-n]",
                         _             => "",
                     };
-                    if let Ok(mut g) = R2.lock() { *g = Some(session); }
+                    if let Ok(mut g) = R2.lock() { *g = Some(R2Cell(pipe)); }
 
                     // Auto-load r2 skill: prefer skills/radare2.md, fall back to built-in
                     let skill_content = std::fs::read_to_string("skills/radare2.md")
@@ -901,29 +893,11 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
             match R2.lock() {
                 Ok(mut g) => match g.as_mut() {
                     None => "No r2 session open. Use r2_open first.".to_string(),
-                    Some(session) => {
-                        // Send command(s) followed by sentinel
-                        let payload = format!("{command}\n?e --OFFCODE--\n");
-                        if let Err(e) = session.stdin.write_all(payload.as_bytes()) {
-                            return format!("r2 write error: {e}");
-                        }
-                        let _ = session.stdin.flush();
-                        // Read lines until sentinel
-                        let mut out = String::new();
-                        let mut line = String::new();
-                        loop {
-                            line.clear();
-                            match session.stdout.read_line(&mut line) {
-                                Ok(0) => { out.push_str("[r2 process ended]"); break; }
-                                Ok(_) => {
-                                    if line.trim() == "--OFFCODE--" { break; }
-                                    out.push_str(&line);
-                                }
-                                Err(e) => { out.push_str(&format!("[read error: {e}]")); break; }
-                            }
-                        }
-                        if out.is_empty() { "(no output)".to_string() } else { out }
-                    }
+                    Some(pipe) => match pipe.0.cmd(&command) {
+                        Ok(out) if out.is_empty() => "(no output)".to_string(),
+                        Ok(out) => out,
+                        Err(e)  => format!("r2 error: {e}"),
+                    },
                 },
                 Err(_) => "r2 lock error".to_string(),
             }
@@ -933,9 +907,8 @@ pub fn execute(name: &str, raw_args: &Value) -> String {
             match R2.lock() {
                 Ok(mut g) => match g.take() {
                     None => "No r2 session open.".to_string(),
-                    Some(mut session) => {
-                        let _ = session.stdin.write_all(b"q\n");
-                        let _ = session.child.wait();
+                    Some(mut pipe) => {
+                        pipe.0.close();
                         "r2 session closed.".to_string()
                     }
                 },
@@ -1280,8 +1253,7 @@ pub fn cleanup_all() -> Vec<String> {
 
     if let Ok(mut g) = R2.lock() {
         if let Some(mut s) = g.take() {
-            let _ = s.stdin.write_all(b"q\n");
-            let _ = s.child.wait();
+            s.0.close();
             closed.push("r2: session closed".into());
         }
     }
@@ -1419,20 +1391,6 @@ fn strip_ansi(s: &str) -> String {
 // ── radare2 helpers ───────────────────────────────────────────────────────────
 
 // Drain any initial output (banner/prompt) with a short timeout via non-blocking read
-fn r2_drain(stdout: &mut BufReader<std::process::ChildStdout>) {
-    // r2 -q0 prints a null byte as prompt; consume everything available briefly
-    let mut line = String::new();
-    // Read until the null-byte prompt line or first empty read
-    for _ in 0..32 {
-        line.clear();
-        match stdout.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) if line.contains('\0') => break,
-            _ => {}
-        }
-    }
-}
-
 // ── browser helpers ───────────────────────────────────────────────────────────
 
 fn browser_get(url: &str, cookies: &str) -> Result<(String, Vec<String>, String), String> {

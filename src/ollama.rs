@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 // ── public types ────────────────────────────────────────────────────────────
 
@@ -39,6 +42,10 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
     pub options: Options,
+    // When Some(false), explicitly disable native thinking on models that support it.
+    // When None, Ollama uses its default (thinking enabled for thinking-capable models).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,7 +191,12 @@ pub fn format_model_listing(
     caps: &[ModelCaps],
     selected: &str,
 ) -> Vec<(String, bool)> {
-    let name_w = models.iter().map(|m| m.name.len()).max().unwrap_or(20).max(20);
+    let name_w = models
+        .iter()
+        .map(|m| m.name.len())
+        .max()
+        .unwrap_or(20)
+        .max(20);
     let mut out = Vec::with_capacity(models.len());
     for (m, c) in models.iter().zip(caps.iter()) {
         let is_sel = m.name == selected;
@@ -254,8 +266,8 @@ impl Client {
                 continue;
             }
 
-            let chunk: RawChunk = serde_json::from_str(&line)
-                .map_err(|e| format!("Stream parse error: {e}"))?;
+            let chunk: RawChunk =
+                serde_json::from_str(&line).map_err(|e| format!("Stream parse error: {e}"))?;
 
             // Thinking tokens (Ollama native thinking field, e.g. Qwen3)
             if show_thinking {
@@ -291,7 +303,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::{atomic::AtomicBool, Arc};
 
     fn local_client() -> Client {
         Client::new("http://localhost:11434")
@@ -308,14 +320,18 @@ mod tests {
     #[test]
     fn ollama_is_healthy() {
         let client = local_client();
-        if !client.is_healthy() { return; }
+        if !client.is_healthy() {
+            return;
+        }
         assert!(client.is_healthy());
     }
 
     #[test]
     fn model_returns_nonempty_response() {
         let client = local_client();
-        if !client.is_healthy() { return; }
+        if !client.is_healthy() {
+            return;
+        }
 
         let request = ChatRequest {
             model: test_model(),
@@ -326,19 +342,28 @@ mod tests {
             }],
             stream: true,
             tools: vec![],
-            options: Options { temperature: 0.0, num_ctx: 512 },
+            options: Options {
+                temperature: 0.0,
+                num_ctx: 512,
+            },
+            think: None,
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let (content, tool_calls) = client
             .chat_stream(&request, false, cancel, |_, _| {})
             .expect("chat_stream should succeed");
-        assert!(!content.is_empty() || tool_calls.is_some(), "model should return a response");
+        assert!(
+            !content.is_empty() || tool_calls.is_some(),
+            "model should return a response"
+        );
     }
 
     #[test]
     fn model_can_use_read_file_tool() {
         let client = local_client();
-        if !client.is_healthy() { return; }
+        if !client.is_healthy() {
+            return;
+        }
 
         let tools = crate::tools::definitions();
         let dir = tempfile::tempdir().unwrap();
@@ -349,12 +374,19 @@ mod tests {
             model: test_model(),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: format!("Read the file at {} and tell me what it says.", file.display()),
+                content: format!(
+                    "Read the file at {} and tell me what it says.",
+                    file.display()
+                ),
                 tool_calls: None,
             }],
             stream: true,
             tools,
-            options: Options { temperature: 0.0, num_ctx: 2048 },
+            options: Options {
+                temperature: 0.0,
+                num_ctx: 2048,
+            },
+            think: Some(true),
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let result = client.chat_stream(&request, false, cancel, |_, _| {});

@@ -10,6 +10,8 @@ pub struct Config {
     pub temperature: f64,
     pub num_ctx: u32,
     pub show_thinking: bool,
+    #[serde(default = "default_think")]
+    pub think: bool,
     pub max_tool_iters: u32,
     #[serde(default = "default_yolo")]
     pub yolo: bool,
@@ -32,6 +34,7 @@ pub struct Config {
 }
 
 fn default_yolo() -> bool { false }
+fn default_think() -> bool { true }
 fn default_tts() -> bool { false }
 fn default_tts_lang() -> String { "es".to_string() }
 fn default_stt() -> bool { false }
@@ -68,6 +71,7 @@ impl Default for Config {
             temperature: 0.6,
             num_ctx: 16384,
             show_thinking: false,
+            think: true,
             max_tool_iters: 30,
             yolo: false,
             auto_approve_tools: default_auto_approve(),
